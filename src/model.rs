@@ -22,8 +22,12 @@ struct ActiveMask {
 }
 
 fn effective_pixel_batch(requested: usize) -> usize {
-    // Align legacy 5000 default to 4096 so full and partial chunks share power-of-two buckets.
-    if requested == 5000 { 4096 } else { requested.max(1) }
+    // Map legacy 5000 / 4096 chunk defaults to 65536 so full patches fit in a single batch.
+    if requested == 5000 || requested == 4096 {
+        65536
+    } else {
+        requested.max(1)
+    }
 }
 
 /// Borrowed from `supernormal-rs` (`Field::static_bucket_size`):
@@ -51,15 +55,17 @@ pub struct ModelOptions {
     /// Spatial flash query limit; 0 uses all queries. Unfused scores are always bounded.
     pub query_batch: usize,
     pub fused_attention: bool,
+    pub score_budget_mib: usize,
 }
 impl Default for ModelOptions {
     fn default() -> Self {
         Self {
             dtype: FloatDType::F32,
             encoder_batch: 8,
-            pixel_batch: 4096,
+            pixel_batch: 65536,
             query_batch: 0,
-            fused_attention: true,
+            fused_attention: false,
+            score_budget_mib: 512,
         }
     }
 }
@@ -359,7 +365,7 @@ impl Model {
             activation::softmax(scores, 3).matmul(v.clone())
         };
         let elem_bytes = if self.options.dtype == FloatDType::F16 { 2 } else { 4 };
-        let score_limit = (64 * 1024 * 1024usize / (b * heads * m * elem_bytes)).max(1);
+        let score_limit = (self.options.score_budget_mib.max(1) * 1024 * 1024usize / (b * heads * m * elem_bytes)).max(1);
         let score_limit = if spatial { 1usize << score_limit.ilog2() } else { score_limit };
         let requested = if !spatial || self.options.query_batch == 0 { n }
             else { self.options.query_batch.min(n) };
@@ -519,7 +525,7 @@ impl Model {
     /// Pre-warm and compile all unique GPU kernels (spatial attention, convolutions, norms,
     /// set-transformer GEMMs, and decoder up-blocks) for both Net_first and Net_stage.
     pub fn warmup(&self, lights: usize) -> Result<()> {
-        let lights = lights.min(self.options.encoder_batch).max(1);
+        let lights = lights.max(1);
 
         // 1. Warm Net_first (32x32 global coarse stage)
         let dummy_first = Tensor::zeros([lights, 3, 32, 32], self.tensor_options());

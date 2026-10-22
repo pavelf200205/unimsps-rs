@@ -23,10 +23,10 @@ struct Cli {
     /// Auto selects WGPU on every build. CUDA is only used when explicitly requested.
     #[arg(long,default_value="auto",value_parser=["auto","cuda","vulkan","dx12","metal"])]
     api: String,
-    /// Set-transformer pixel batch size (defaults to power-of-two 4096 to avoid shape explosion).
-    #[arg(long, default_value_t = 4096)]
+    /// Set-transformer pixel batch size (defaults to 65536 to process entire patches in one batch).
+    #[arg(long, default_value_t = 65536)]
     pixel_batch: usize,
-    /// Spatial attention query limit; 0 uses one fused dispatch. Unfused scores remain bounded.
+    /// Spatial attention query limit; 0 uses full chunk budget. Unfused scores remain bounded.
     #[arg(long, default_value_t = 0)]
     query_batch: usize,
     #[arg(long, default_value_t = 8)]
@@ -37,7 +37,13 @@ struct Cli {
     /// RGB input/pyramid cache budget, excluding model weights and normal maps.
     #[arg(long, default_value_t = 512)]
     image_cache_mib: usize,
-    /// Use explicit matmul/softmax spatial attention instead of fused SDPA dispatch.
+    /// Memory budget in MiB for attention score matrix allocation before chunking (default: 512 MiB).
+    #[arg(long, default_value_t = 512)]
+    score_budget_mib: usize,
+    /// Force custom subgroup fused spatial attention instead of standard hardware GEMM.
+    #[arg(long)]
+    fused_attention: bool,
+    /// Legacy flag: Use explicit matmul/softmax spatial attention (now the default).
     #[arg(long)]
     unfused_attention: bool,
     /// Skip pipeline and GPU kernel pre-warm pass before timed inference.
@@ -57,7 +63,7 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
         /// Number of input photographs; -1 uses all. A subset uses lexical filename order.
-        #[arg(long, visible_aliases = ["nb-img", "nb_img"], default_value_t = -1, allow_hyphen_values = true)]
+        #[arg(long, visible_aliases = ["nb-img", "nb_img", "num-images", "num_images", "num-imgs", "num_imgs"], default_value_t = -1, allow_hyphen_values = true)]
         images: isize,
         /// Treat each immediate subdirectory as a separate object, loading the model once.
         #[arg(long)]
@@ -143,14 +149,44 @@ fn main() -> Result<()> {
                 encoder_batch: cli.encoder_batch,
                 pixel_batch: cli.pixel_batch,
                 query_batch: cli.query_batch,
-                fused_attention: !cli.unfused_attention,
+                fused_attention: cli.fused_attention && !cli.unfused_attention,
+                score_budget_mib: cli.score_budget_mib,
             })?;
             drop(load_profile);
-            eprintln!("Precision: {dtype:?}; encoder batch: {}; pixel batch: {}", cli.encoder_batch, net.options.pixel_batch);
+            eprintln!(
+                "Precision: {dtype:?}; encoder batch: {}; pixel batch: {}; score budget: {} MiB; attention: {}",
+                cli.encoder_batch,
+                net.options.pixel_batch,
+                net.options.score_budget_mib,
+                if net.options.fused_attention { "fused subgroup" } else { "hardware GEMM" }
+            );
             if !cli.no_warmup && !cli.cpu {
-                eprintln!("Pre-warming GPU kernels (spatial attention, GEMMs, norms, decoders)...");
+                let warmup_lights = if let Some(limit) = image_limit {
+                    limit.max(1)
+                } else if let Some(first_obj) = objects.first() {
+                    let count = std::fs::read_dir(first_obj)
+                        .ok()
+                        .map(|entries| {
+                            entries
+                                .filter_map(|e| e.ok().map(|e| e.path()))
+                                .filter(|p| {
+                                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                                    let ext = p.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+                                    p.is_file()
+                                        && !name.contains("mask")
+                                        && !name.contains("normal")
+                                        && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "tif" | "tiff")
+                                })
+                                .count()
+                        })
+                        .unwrap_or(cli.encoder_batch);
+                    count.max(1)
+                } else {
+                    cli.encoder_batch
+                };
+                eprintln!("Pre-warming GPU kernels (spatial attention, GEMMs, norms, decoders for {warmup_lights} lights)...");
                 let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/pipeline".into());
-                net.warmup(cli.encoder_batch)?;
+                net.warmup(warmup_lights)?;
                 drop(warmup_profile);
                 eprintln!("Warmup complete.");
             }
@@ -200,7 +236,8 @@ fn main() -> Result<()> {
                     "precision": format!("{dtype:?}"), "images": input.images.len(),
                     "padded_size": input.size, "encoder_batch": cli.encoder_batch,
                     "pixel_batch": net.options.pixel_batch, "query_batch": cli.query_batch,
-                    "image_cache_mib": cli.image_cache_mib, "unfused_attention": cli.unfused_attention,
+                    "image_cache_mib": cli.image_cache_mib, "unfused_attention": !net.options.fused_attention,
+                    "fused_attention": net.options.fused_attention, "score_budget_mib": net.options.score_budget_mib,
                     "queue_depth": cli.queue_depth,
                     "object": object, "model": model,
                 }))?;
