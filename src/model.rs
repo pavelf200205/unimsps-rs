@@ -341,7 +341,7 @@ impl Model {
         let rows = batch * oh * ow;
         let bytes = if self.options.dtype == FloatDType::F16 { 2 } else { 4 };
         // Each packed workspace is at most 16 MiB (not a total VRAM cap).
-        let limit = (16 * 1024 * 1024 / (channels * kernel * kernel * bytes)).max(1);
+        let limit = (128 * 1024 * 1024 / (channels * kernel * kernel * bytes)).max(1);
         let chunk_rows = (1usize << limit.ilog2()).min(rows);
         crate::profile::event(|| format!("conv/gemm {p} chunk_rows={chunk_rows} reduction={}", channels * kernel * kernel));
         let mut result = if chunk_rows < rows { Some(Tensor::<2>::empty([rows, output], self.tensor_options())) } else { None };
@@ -424,6 +424,7 @@ impl Model {
         let v = v.reshape([b, m, heads, d]).permute([0, 2, 1, 3]);
         let flash = spatial && n >= 4096 && m >= 64 && self.options.fused_attention && crate::attention::supported(&q, &k);
         let kt = k.clone().swap_dims(2, 3);
+        let scaled_kt = kt * scale;
         let compute = |q: Tensor<4>| {
             let _profile = crate::profile::span(&self.device, || format!("attention/chunk {} Q={:?} K={m}", if flash { "flash" } else { "gemm" }, q.dims()));
             if flash {
@@ -432,7 +433,7 @@ impl Model {
                 }
             }
             let qk_profile = crate::profile::span(&self.device, || format!("attention/qk-gemm Q={:?} K={m}", q.dims()));
-            let scores = (q * scale).matmul(kt.clone());
+            let scores = q.matmul(scaled_kt.clone());
             drop(qk_profile);
             let softmax_profile = crate::profile::span(&self.device, || format!("attention/softmax shape={:?}", scores.dims()));
             let probabilities = if self.options.fused_softmax {
@@ -620,9 +621,12 @@ impl Model {
                 mask256[y * 256 + x] = true;
             }
         }
-        let _ = self.forward_masked(dummy_stage, true, Some(&mask256))?;
+        let _ = self.forward_masked(dummy_stage.clone(), true, Some(&mask256))?;
 
-        // 3. Ensure all pipeline shader compilations and autotunings complete
+        // 3. Warm dense Net_stage (full 256x256 patch without masking)
+        let _ = self.forward_masked(dummy_stage, true, None)?;
+
+        // 4. Ensure all pipeline shader compilations and autotunings complete
         self.device.sync().ok();
         Ok(())
     }
