@@ -612,7 +612,14 @@ impl Model {
         let mask32 = vec![true; 32 * 32];
         let _ = self.forward_masked(dummy_first, false, Some(&mask32))?;
 
-        // 2. Warm Net_stage (256x256 patch refinement stage)
+        // 2. Warm intermediate scales (64x64, 128x128)
+        for &sz in &[64, 128] {
+            let dummy = Tensor::zeros([lights, 6, sz, sz], self.tensor_options());
+            let mask = vec![true; sz * sz];
+            let _ = self.forward_masked(dummy, true, Some(&mask))?;
+        }
+
+        // 3. Warm Net_stage (256x256 patch refinement stage)
         // With an active circular mask to exercise foreground token gathering and set-transformer buckets
         let dummy_stage = Tensor::zeros([lights, 6, 256, 256], self.tensor_options());
         let mut mask256 = vec![false; 256 * 256];
@@ -623,10 +630,10 @@ impl Model {
         }
         let _ = self.forward_masked(dummy_stage.clone(), true, Some(&mask256))?;
 
-        // 3. Warm dense Net_stage (full 256x256 patch without masking)
+        // 4. Warm dense Net_stage (full 256x256 patch without masking)
         let _ = self.forward_masked(dummy_stage, true, None)?;
 
-        // 4. Ensure all pipeline shader compilations and autotunings complete
+        // 5. Ensure all pipeline shader compilations and autotunings complete
         self.device.sync().ok();
         Ok(())
     }
@@ -692,44 +699,44 @@ impl Model {
                 }
             }
             let active_mask = current_mask.as_ref().and_then(|m| {
+                let keep_count = m.iter().filter(|&&k| k).count();
+                // Only use gather/scatter when it saves at least 10% of pixels and is non-empty
+                if keep_count == 0 || keep_count * 10 >= m.len() * 9 {
+                    return None;
+                }
                 let indices: Vec<i32> = m
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, &keep)| if keep { Some(idx as i32) } else { None })
                     .collect();
-                // Only use gather/scatter when it saves at least 10% of pixels and is non-empty
-                if !indices.is_empty() && indices.len() * 10 < m.len() * 9 {
-                    let valid_len = indices.len();
-                    let full_chunks = (valid_len / batch_limit) * batch_limit;
-                    let rem = valid_len - full_chunks;
-                    let padded_len = if rem == 0 {
-                        valid_len
-                    } else {
-                        full_chunks + static_bucket_size(rem, batch_limit)
-                    };
-                    let scatter_idx = Tensor::<1, burn::tensor::Int>::from_data(
-                        TensorData::new(indices.clone(), [valid_len]),
-                        &self.device,
-                    );
-                    let gather_idx = if padded_len > valid_len {
-                        let mut padded = indices;
-                        padded.resize(padded_len, 0);
-                        Tensor::<1, burn::tensor::Int>::from_data(
-                            TensorData::new(padded, [padded_len]),
-                            &self.device,
-                        )
-                    } else {
-                        scatter_idx.clone()
-                    };
-                    Some(ActiveMask {
-                        gather_idx,
-                        scatter_idx,
-                        valid_len,
-                        padded_len,
-                    })
+                let valid_len = indices.len();
+                let full_chunks = (valid_len / batch_limit) * batch_limit;
+                let rem = valid_len - full_chunks;
+                let padded_len = if rem == 0 {
+                    valid_len
                 } else {
-                    None
-                }
+                    full_chunks + static_bucket_size(rem, batch_limit)
+                };
+                let scatter_idx = Tensor::<1, burn::tensor::Int>::from_data(
+                    TensorData::new(indices.clone(), [valid_len]),
+                    &self.device,
+                );
+                let gather_idx = if padded_len > valid_len {
+                    let mut padded = indices;
+                    padded.resize(padded_len, 0);
+                    Tensor::<1, burn::tensor::Int>::from_data(
+                        TensorData::new(padded, [padded_len]),
+                        &self.device,
+                    )
+                } else {
+                    scatter_idx.clone()
+                };
+                Some(ActiveMask {
+                    gather_idx,
+                    scatter_idx,
+                    valid_len,
+                    padded_len,
+                })
             });
 
             drop(mask_profile);

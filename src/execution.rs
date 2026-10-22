@@ -20,14 +20,10 @@ pub(crate) fn checkpoint(device: &Device, completed: usize) {
 }
 
 pub(crate) fn flush(device: &Device) {
-    // Submit recorded fusion streams asynchronously when queue_depth == 0,
-    // or wait synchronously only when an explicit positive queue_depth is configured.
+    // Submit recorded fusion streams asynchronously to keep fusion graph bounded
+    // without stalling the CPU thread. Checkpoints handle queue-depth synchronizations.
     if !crate::profile::enabled() {
-        if depth() != 0 {
-            device.sync().expect("GPU completion failed at inference queue boundary");
-        } else {
-            let _ = device.flush();
-        }
+        let _ = device.flush();
     }
 }
 

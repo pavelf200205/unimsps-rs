@@ -420,11 +420,13 @@ fn stage_device(
     keep_mask: Tensor<4, Bool>,
     host_mask: Option<&[bool]>,
 ) -> Result<Tensor<4>> {
-    let refinement = normal.is_some();
     let lights = images.dims()[0];
-    let images = if let Some(normal) = normal {
-        Tensor::cat(vec![images, normal.cast(model.options.dtype).repeat_dim(0, lights)], 1)
-    } else { images };
+    let (images, refinement) = if let Some(normal) = normal {
+        (Tensor::cat(vec![images, normal.cast(model.options.dtype).repeat_dim(0, lights)], 1), true)
+    } else {
+        let is_6ch = images.dims()[1] == 6;
+        (images, is_6ch)
+    };
     let raw = model.forward_masked(images, refinement, host_mask)?;
     Ok(raw.cast(model.options.dtype).mask_fill(keep_mask.bool_not(), 0.))
 }
@@ -526,6 +528,14 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
             let total = ((size - 256) / 128 + 1).pow(2);
             let mut count = 0;
             let mut patch_host_mask = vec![false; 256 * 256];
+            let lights = input.images.len();
+            let full_device_images = match &active {
+                ImageLevel::Device(images) => Some(Tensor::cat(
+                    vec![images.clone(), prior.clone().repeat_dim(0, lights)],
+                    1,
+                )),
+                ImageLevel::Host(_) => None,
+            };
             for y in (0..=size - 256).step_by(128) {
                 for x in (0..=size - 256).step_by(128) {
                     count += 1;
@@ -542,12 +552,17 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     }
                     let _patch_profile = crate::profile::phase(&model.device, || format!("patch/size={size} y={y} x={x} foreground={fg_count}"));
                     let prepare_patch_profile = crate::profile::span(&model.device, || format!("patch/prepare size={size}"));
-                    let images = match &active {
-                        ImageLevel::Device(images) => images.clone().slice([
-                            0..input.images.len(), 0..3, y..y + 256, x..x + 256]),
-                        ImageLevel::Host(images) => {
+                    let (images, n_opt) = match &full_device_images {
+                        Some(full) => {
+                            let patch = full.clone().slice([0..lights, 0..6, y..y + 256, x..x + 256]);
+                            (patch, None)
+                        }
+                        None => {
+                            let ImageLevel::Host(images) = &active else { unreachable!() };
                             let patches: Vec<_> = images.par_iter().map(|r| r.crop(y, x, 256, 256)).collect();
-                            upload_images(model, &patches)
+                            let imgs = upload_images(model, &patches);
+                            let n = prior.clone().slice([0..1, 0..3, y..y + 256, x..x + 256]);
+                            (imgs, Some(n))
                         }
                     };
                     let row = if y == 0 { 0 } else if y + 256 == size { 2 } else { 1 };
@@ -555,9 +570,13 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     // Preserve upstream's border-exclusion * background-mask rule.
                     let patch_mask = mask.clone().slice([0..1, 0..1, y..y + 256, x..x + 256])
                         .bool_or(interiors[row * 3 + col].clone());
-                    let n = prior.clone().slice([0..1, 0..3, y..y + 256, x..x + 256]);
                     drop(prepare_patch_profile);
-                    let prediction = stage_device(model, images, Some(n), patch_mask, Some(&patch_host_mask))?;
+                    let host_mask_slice = if fg_count * 10 < 256 * 256 * 9 {
+                        Some(patch_host_mask.as_slice())
+                    } else {
+                        None
+                    };
+                    let prediction = stage_device(model, images, n_opt, patch_mask, host_mask_slice)?;
                     let blend_profile = crate::profile::span(&model.device, || format!("patch/blend size={size}"));
                     let weighted = prediction.cast(model.options.dtype) * gaussian.as_ref().unwrap().clone();
                     let region = [0..1, 0..3, y..y + 256, x..x + 256];
