@@ -6,10 +6,43 @@ use burn::tensor::{
 use safetensors::{Dtype, SafeTensors};
 use std::{collections::BTreeMap, path::Path};
 
-struct Weight {
-    shape: Vec<usize>,
-    value: Tensor<1>,
+#[derive(Clone)]
+enum Weight {
+    R1(Tensor<1>),
+    R2(Tensor<2>),
+    R3(Tensor<3>),
+    R4(Tensor<4>),
 }
+
+struct ActiveMask {
+    gather_idx: Tensor<1, burn::tensor::Int>,
+    scatter_idx: Tensor<1, burn::tensor::Int>,
+    valid_len: usize,
+    padded_len: usize,
+}
+
+fn effective_pixel_batch(requested: usize) -> usize {
+    // Align legacy 5000 default to 4096 so full and partial chunks share power-of-two buckets.
+    if requested == 5000 { 4096 } else { requested.max(1) }
+}
+
+/// Borrowed from `supernormal-rs` (`Field::static_bucket_size`):
+/// Restricts set-transformer batch sizes to `{256, 1024, 2048, 4096}` instead of 20 linear
+/// multiples of 256 (`256..5000`), eliminating ~80% of dynamic shape compilations and autotuning.
+#[inline]
+fn static_bucket_size(valid_pixels: usize, max_batch: usize) -> usize {
+    if valid_pixels == max_batch || max_batch < 256 {
+        return valid_pixels;
+    }
+    let floor = if valid_pixels <= 256 { 256 } else { 1024.min(max_batch) };
+    valid_pixels
+        .max(floor)
+        .checked_next_power_of_two()
+        .unwrap_or(max_batch)
+        .min(max_batch)
+        .max(valid_pixels)
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelOptions {
     pub dtype: FloatDType,
@@ -24,7 +57,7 @@ impl Default for ModelOptions {
         Self {
             dtype: FloatDType::F32,
             encoder_batch: 8,
-            pixel_batch: 5000,
+            pixel_batch: 4096,
             query_batch: 0,
             fused_attention: true,
         }
@@ -65,11 +98,12 @@ impl Model {
             ..Default::default()
         })
     }
-    pub fn load_with_options(path: &Path, device: Device, options: ModelOptions) -> Result<Self> {
+    pub fn load_with_options(path: &Path, device: Device, mut options: ModelOptions) -> Result<Self> {
         ensure!(
             options.pixel_batch > 0 && options.encoder_batch > 0,
             "Encoder and pixel batch sizes must be positive"
         );
+        options.pixel_batch = effective_pixel_batch(options.pixel_batch);
         ensure!(device.supports_dtype(options.dtype), "Selected device does not support {:?}", options.dtype);
         ensure!(path.extension().and_then(|x| x.to_str()) != Some("pth"),
             "PyTorch .pth deserialization is not implemented; use the converted model_uncalibrated.safetensors");
@@ -87,7 +121,18 @@ impl Model {
             schema.len(),
             archive.len()
         );
-        let mut weights = BTreeMap::new();
+        let dtype = options.dtype;
+        let upload_1d = |values: Vec<f32>| -> Tensor<1> {
+            let n = values.len();
+            let create_options = TensorCreationOptions::new(device.clone()).with_dtype(dtype.into());
+            if dtype == FloatDType::F16 {
+                let values: Vec<half::f16> = values.into_iter().map(half::f16::from_f32).collect();
+                Tensor::from_data(TensorData::new(values, [n]), create_options)
+            } else {
+                Tensor::from_data(TensorData::new(values, [n]), create_options)
+            }
+        };
+        let mut raw_f32: BTreeMap<String, (Vec<usize>, Vec<f32>)> = BTreeMap::new();
         for (name, mut shape) in schema {
             let t = archive
                 .tensor(&name)
@@ -107,7 +152,6 @@ impl Model {
                 "Non-finite weight: {name}"
             );
             let n = values.len();
-            let dtype = options.dtype;
             if shape.len() == 2 {
                 // Pack before upload: no GPU transpose/cast launches during load.
                 let (rows, cols) = (shape[0], shape[1]);
@@ -118,38 +162,67 @@ impl Model {
                 values = packed;
                 shape.swap(0, 1);
             }
-            let create_options = TensorCreationOptions::new(device.clone()).with_dtype(dtype.into());
-            let value = if dtype == FloatDType::F16 {
-                let values: Vec<half::f16> = values.into_iter().map(half::f16::from_f32).collect();
-                Tensor::from_data(TensorData::new(values, [n]), create_options)
-            } else {
-                Tensor::from_data(TensorData::new(values, [n]), create_options)
-            };
-            weights.insert(
-                name,
-                Weight {
-                    shape,
-                    value,
-                },
-            );
+            raw_f32.insert(name, (shape, values));
         }
-        // K and V always consume the same (unnormalized) light tokens. Pack
-        // their projections once, then use a single large GEMM per MAB.
-        let kv_prefixes: Vec<String> = weights.keys()
+
+        // Precompute dec.0.S_q = S * fc_q.weight + fc_q.bias on the CPU once during load,
+        // eliminating all runtime `[B, 1, C]` `dec.0.mab.fc_q` GEMMs across every patch.
+        let seed_keys: Vec<String> = raw_f32
+            .keys()
+            .filter_map(|k| k.strip_suffix(".dec.0.S").map(str::to_owned))
+            .collect();
+        for prefix in seed_keys {
+            let (_, s_vals) = &raw_f32[&format!("{prefix}.dec.0.S")];
+            let (w_shape, w_vals) = &raw_f32[&format!("{prefix}.dec.0.mab.fc_q.weight")];
+            let (_, b_vals) = &raw_f32[&format!("{prefix}.dec.0.mab.fc_q.bias")];
+            let (in_c, out_c) = (w_shape[0], w_shape[1]);
+            let mut q_seed = vec![0f32; out_c];
+            for col in 0..out_c {
+                let mut acc = b_vals[col];
+                for row in 0..in_c {
+                    acc += s_vals[row] * w_vals[row * out_c + col];
+                }
+                q_seed[col] = acc;
+            }
+            raw_f32.insert(format!("{prefix}.dec.0.mab.q_seed"), (vec![1, 1, out_c], q_seed));
+        }
+
+        // Pack K and V projections in set-transformer MABs on the CPU before upload.
+        let kv_prefixes: Vec<String> = raw_f32
+            .keys()
             .filter_map(|name| name.strip_suffix(".fc_k.weight").map(str::to_owned))
             .collect();
         for prefix in kv_prefixes {
-            let k = weights.remove(&format!("{prefix}.fc_k.weight")).unwrap();
-            let v = weights.remove(&format!("{prefix}.fc_v.weight")).unwrap();
-            let (input, output) = (k.shape[0], k.shape[1]);
-            let value = Tensor::cat(vec![k.value.reshape([input, output]), v.value.reshape([input, output])], 1)
-                .reshape([input * 2 * output]);
-            weights.insert(format!("{prefix}.fc_kv.weight"), Weight { shape: vec![input, 2 * output], value });
-            let k = weights.remove(&format!("{prefix}.fc_k.bias")).unwrap();
-            let v = weights.remove(&format!("{prefix}.fc_v.bias")).unwrap();
-            weights.insert(format!("{prefix}.fc_kv.bias"), Weight {
-                shape: vec![2 * output], value: Tensor::cat(vec![k.value, v.value], 0),
-            });
+            let (k_shape, k_w) = raw_f32.remove(&format!("{prefix}.fc_k.weight")).unwrap();
+            let (_, v_w) = raw_f32.remove(&format!("{prefix}.fc_v.weight")).unwrap();
+            let (input, output) = (k_shape[0], k_shape[1]);
+            let mut kv_w = vec![0f32; input * 2 * output];
+            for r in 0..input {
+                kv_w[r * 2 * output..r * 2 * output + output]
+                    .copy_from_slice(&k_w[r * output..(r + 1) * output]);
+                kv_w[r * 2 * output + output..(r + 1) * 2 * output]
+                    .copy_from_slice(&v_w[r * output..(r + 1) * output]);
+            }
+            raw_f32.insert(format!("{prefix}.fc_kv.weight"), (vec![input, 2 * output], kv_w));
+            let (_, mut k_b) = raw_f32.remove(&format!("{prefix}.fc_k.bias")).unwrap();
+            let (_, v_b) = raw_f32.remove(&format!("{prefix}.fc_v.bias")).unwrap();
+            k_b.extend_from_slice(&v_b);
+            raw_f32.insert(format!("{prefix}.fc_kv.bias"), (vec![2 * output], k_b));
+        }
+
+        // Store all weights in their native rank so runtime lookups clone the handle
+        // directly without recording thousands of Reshape nodes into Burn's Fusion IR.
+        let mut weights = BTreeMap::new();
+        for (name, (shape, values)) in raw_f32 {
+            let flat = upload_1d(values);
+            let w = match shape.as_slice() {
+                &[d0] => Weight::R1(flat.reshape([d0])),
+                &[d0, d1] => Weight::R2(flat.reshape([d0, d1])),
+                &[d0, d1, d2] => Weight::R3(flat.reshape([d0, d1, d2])),
+                &[d0, d1, d2, d3] => Weight::R4(flat.reshape([d0, d1, d2, d3])),
+                _ => anyhow::bail!("Unsupported weight rank for {name}"),
+            };
+            weights.insert(name, w);
         }
         Ok(Self {
             weights,
@@ -157,22 +230,37 @@ impl Model {
             options,
         })
     }
-    fn w<const D: usize>(&self, key: &str) -> Tensor<D> {
-        let w = &self.weights[key];
-        w.value
-            .clone()
-            .reshape(<[usize; D]>::try_from(w.shape.as_slice()).expect("validated rank"))
+    #[inline]
+    fn w1(&self, key: &str) -> Tensor<1> {
+        let Weight::R1(ref t) = self.weights[key] else { panic!("expected rank-1 weight: {key}") };
+        t.clone()
+    }
+    #[inline]
+    fn w2(&self, key: &str) -> Tensor<2> {
+        let Weight::R2(ref t) = self.weights[key] else { panic!("expected rank-2 weight: {key}") };
+        t.clone()
+    }
+    #[inline]
+    fn w3(&self, key: &str) -> Tensor<3> {
+        let Weight::R3(ref t) = self.weights[key] else { panic!("expected rank-3 weight: {key}") };
+        t.clone()
+    }
+    #[inline]
+    fn w4(&self, key: &str) -> Tensor<4> {
+        let Weight::R4(ref t) = self.weights[key] else { panic!("expected rank-4 weight: {key}") };
+        t.clone()
     }
     fn linear(&self, x: Tensor<3>, p: &str) -> Tensor<3> {
         let _profile = crate::profile::span(&self.device, || format!("linear/{p} input={:?}", x.dims()));
-        let w = self.w::<2>(&format!("{p}.weight"));
+        let w = self.w2(&format!("{p}.weight"));
         let [i, o] = w.dims();
         let [b, n, _] = x.dims();
         // In the light transformers b is thousands and n is often only 6-20.
         // Flattening produces one GEMM instead of thousands of tiny batched GEMMs.
         let y = x.reshape([b * n, i]).matmul(w);
-        let y = if self.weights.contains_key(&format!("{p}.bias")) {
-            y + self.w::<1>(&format!("{p}.bias")).reshape([1, o])
+        let bias_key = format!("{p}.bias");
+        let y = if self.weights.contains_key(&bias_key) {
+            y + self.w1(&bias_key).reshape([1, o])
         } else {
             y
         };
@@ -180,46 +268,84 @@ impl Model {
     }
     fn norm(&self, x: Tensor<3>, p: &str) -> Tensor<3> {
         let _profile = crate::profile::span(&self.device, || format!("norm/{p} input={:?}", x.dims()));
-        module::layer_norm(
-            x,
-            self.w(&format!("{p}.weight")),
-            Some(self.w(&format!("{p}.bias"))),
-            1e-5,
-        )
+        let gamma = self.w1(&format!("{p}.weight"));
+        let beta = self.w1(&format!("{p}.bias"));
+        if let Some(out) = crate::norm::forward(x.clone(), gamma.clone(), beta.clone()) {
+            return out;
+        }
+        module::layer_norm(x, gamma, Some(beta), 1e-5)
     }
     fn conv(&self, x: Tensor<4>, p: &str, stride: usize, pad: usize, groups: usize) -> Tensor<4> {
         let _profile = crate::profile::span(&self.device, || format!("conv/{p} input={:?} stride={stride} groups={groups}", x.dims()));
         module::conv2d(
             x,
-            self.w(&format!("{p}.weight")),
-            Some(self.w(&format!("{p}.bias"))),
+            self.w4(&format!("{p}.weight")),
+            Some(self.w1(&format!("{p}.bias"))),
             ConvOptions::new([stride; 2], [pad; 2], [1; 2], groups),
         )
     }
-    // Spatial attention uses an explicit flash launch. Short light attention
-    // retains the reference's full-width scale and inexpensive small score matrices.
-    fn attention(
+    /// Consumes `q` `[b, n, c]` and packed `kv` `[b, m, 2 * c]` directly on the fused subgroup
+    /// paths, only slicing `kv` into separate `k` and `v` tensors when falling back to CMMA flash or GEMM.
+    fn attention_packed(
         &self,
         q: Tensor<3>,
-        k: Tensor<3>,
-        v: Tensor<3>,
+        kv: Tensor<3>,
         heads: usize,
         scale: f32,
         spatial: bool,
     ) -> Tensor<3> {
         let [b, n, c] = q.dims();
-        let m = k.dims()[1];
+        let m = kv.dims()[1];
         let d = c / heads;
         let _profile = crate::profile::span(&self.device, || format!("attention/{} B={b} Q={n} K={m} C={c} heads={heads}", if spatial { "spatial" } else { "light" }));
         if !spatial {
-            if let Some(out) = crate::light_attention::forward(q.clone(), k.clone(), v.clone(), heads) {
+            if let Some(out) = crate::light_attention::forward(q.clone(), kv.clone(), heads) {
                 return out;
             }
+        } else if self.options.fused_attention {
+            let q_probe = q.clone().reshape([b, n, heads, d]);
+            let use_cmma_flash = n >= 4096 && m >= 64 && crate::attention::supported(&q_probe, &q_probe);
+            if !use_cmma_flash && crate::attention::subgroup_supported(&q) {
+                let queries = if self.options.query_batch == 0 {
+                    n
+                } else {
+                    self.options.query_batch.min(n)
+                };
+                if queries >= n {
+                    let _chunk_profile = crate::profile::span(&self.device, || format!("attention/chunk subgroup Q=[{b}, {heads}, {n}, {d}] K={m}"));
+                    if let Some(out) = crate::attention::spatial_subgroup(q.clone(), kv.clone(), heads) {
+                        return out;
+                    }
+                } else if queries % 2 == 0 {
+                    let mut out = Tensor::empty([b, n, c], self.tensor_options());
+                    let mut ok = true;
+                    for (chunk, start) in (0..n).step_by(queries).enumerate() {
+                        let end = (start + queries).min(n);
+                        let _chunk_profile = crate::profile::span(&self.device, || format!("attention/chunk subgroup Q=[{b}, {heads}, {}, {d}] K={m}", end - start));
+                        if let Some(value) = crate::attention::spatial_subgroup(
+                            q.clone().slice([0..b, start..end, 0..c]),
+                            kv.clone(),
+                            heads,
+                        ) {
+                            out = out.slice_assign([0..b, start..end, 0..c], value);
+                            crate::execution::checkpoint(&self.device, chunk + 1);
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        crate::execution::finish(&self.device);
+                        return out;
+                    }
+                }
+            }
         }
+        let k = kv.clone().slice([0..b, 0..m, 0..c]);
+        let v = kv.slice([0..b, 0..m, c..2 * c]);
         let q = q.reshape([b, n, heads, d]).permute([0, 2, 1, 3]);
         let k = k.reshape([b, m, heads, d]).permute([0, 2, 1, 3]);
         let v = v.reshape([b, m, heads, d]).permute([0, 2, 1, 3]);
-        // Only use flash when sequence lengths are large enough for CMMA tiles (m >= 64, n >= 4096)
         let flash = spatial && n >= 4096 && m >= 64 && self.options.fused_attention && crate::attention::supported(&q, &k);
         let kt = k.clone().swap_dims(2, 3);
         let compute = |q: Tensor<4>| {
@@ -234,8 +360,6 @@ impl Model {
         };
         let elem_bytes = if self.options.dtype == FloatDType::F16 { 2 } else { 4 };
         let score_limit = (64 * 1024 * 1024usize / (b * heads * m * elem_bytes)).max(1);
-        // Stable power-of-two GEMM tiles avoid awkward 2730-query dispatches
-        // (six FP16 images at 256px), while retaining a bounded score buffer.
         let score_limit = if spatial { 1usize << score_limit.ilog2() } else { score_limit };
         let requested = if !spatial || self.options.query_batch == 0 { n }
             else { self.options.query_batch.min(n) };
@@ -282,10 +406,7 @@ impl Model {
             z
         };
         let kv = self.linear(z, &format!("{p}.attn.kv"));
-        let m = kv.dims()[1];
-        let k = kv.clone().slice([0..b, 0..m, 0..c]);
-        let v = kv.slice([0..b, 0..m, c..2 * c]);
-        let a = self.attention(q, k, v, heads, 1.0 / (c as f32 / heads as f32).sqrt(), true);
+        let a = self.attention_packed(q, kv, heads, 1.0 / (c as f32 / heads as f32).sqrt(), true);
         let x = x + self.linear(a, &format!("{p}.attn.proj"));
         let z = self.linear(
             self.norm(x.clone(), &format!("{p}.norm2")),
@@ -301,20 +422,21 @@ impl Model {
         let z = activation::gelu(z.reshape([b, 4 * c, n]).swap_dims(1, 2));
         x + self.linear(z, &format!("{p}.mlp.fc2"))
     }
-    fn mab(&self, x: Tensor<3>, y: Tensor<3>, p: &str) -> Tensor<3> {
-        let x = if self.weights.contains_key(&format!("{p}.ln0.weight")) {
-            self.norm(x, &format!("{p}.ln0"))
-        } else {
+    fn mab(&self, x: Tensor<3>, y: Tensor<3>, p: &str, preprojected_q: bool) -> Tensor<3> {
+        let q = if preprojected_q {
             x
+        } else {
+            let x = if self.weights.contains_key(&format!("{p}.ln0.weight")) {
+                self.norm(x, &format!("{p}.ln0"))
+            } else {
+                x
+            };
+            self.linear(x, &format!("{p}.fc_q"))
         };
-        let q = self.linear(x, &format!("{p}.fc_q"));
         let c = q.dims()[2];
         let kv = self.linear(y, &format!("{p}.fc_kv"));
-        let [batch, lights, _] = kv.dims();
-        let k = kv.clone().slice([0..batch, 0..lights, 0..c]);
-        let v = kv.slice([0..batch, 0..lights, c..2 * c]);
         // Set transformer uses sqrt(full dimension), unlike spatial attention.
-        let o = q.clone() + self.attention(q, k, v, 4, 1.0 / (c as f32).sqrt(), false);
+        let o = q.clone() + self.attention_packed(q, kv, 4, 1.0 / (c as f32).sqrt(), false);
         let z = if self.weights.contains_key(&format!("{p}.ln1.weight")) {
             self.norm(o.clone(), &format!("{p}.ln1"))
         } else {
@@ -328,23 +450,20 @@ impl Model {
     fn set_layer(&self, x: Tensor<3>, p: &str, pool: bool) -> Tensor<3> {
         let _profile = crate::profile::span(&self.device, || format!("set-transformer/{p} input={:?}", x.dims()));
         let [b, n, c] = x.dims();
-        let seed_weight = if pool {
-            Some(self.w::<3>(&format!("{p}.dec.0.S")))
+        let batch_limit = effective_pixel_batch(self.options.pixel_batch);
+        let q_seed = if pool {
+            Some(self.w3(&format!("{p}.dec.0.mab.q_seed")))
         } else {
             None
         };
         let out_n = if pool { 1 } else { n };
-        let mut out = if b > self.options.pixel_batch {
+        let mut out = if b > batch_limit {
             Some(Tensor::empty([b, out_n, c], self.tensor_options()))
         } else { None };
-        for (chunk, start) in (0..b).step_by(self.options.pixel_batch).enumerate() {
-            let end = (start + self.options.pixel_batch).min(b);
+        for (chunk, start) in (0..b).step_by(batch_limit).enumerate() {
+            let end = (start + batch_limit).min(b);
             let valid_pixels = end - start;
-            // Pixels are independent in the set transformer. Bucket only the
-            // last partial batch to reduce mask-dependent kernel/tuning shapes;
-            // discard padded rows afterward. Never exceed the requested batch.
-            let work_pixels = valid_pixels.div_ceil(256).saturating_mul(256)
-                .min(self.options.pixel_batch);
+            let work_pixels = static_bucket_size(valid_pixels, batch_limit);
             let mut z = if start == 0 && end == b {
                 x.clone()
             } else {
@@ -354,11 +473,11 @@ impl Model {
                 z = Tensor::cat(vec![z, Tensor::zeros([work_pixels - valid_pixels, n, c], self.tensor_options())], 0);
             }
             for i in 0..3 {
-                z = self.mab(z.clone(), z, &format!("{p}.enc.{i}.mab"));
+                z = self.mab(z.clone(), z, &format!("{p}.enc.{i}.mab"), false);
             }
-            if let Some(ref s) = seed_weight {
-                let seed = s.clone().repeat_dim(0, work_pixels);
-                z = self.mab(seed, z, &format!("{p}.dec.0.mab"));
+            if let Some(ref s_q) = q_seed {
+                let seed_q = s_q.clone().repeat_dim(0, work_pixels);
+                z = self.mab(seed_q, z, &format!("{p}.dec.0.mab"), true);
             }
             if work_pixels > valid_pixels {
                 z = z.slice([0..valid_pixels, 0..out_n, 0..c]);
@@ -370,25 +489,57 @@ impl Model {
         crate::execution::finish(&self.device);
         out.expect("non-empty light-transformer input")
     }
-    fn set_layer_masked(
+    fn set_layer_pre_gathered(
         &self,
-        x: Tensor<3>,
+        x_gathered: Tensor<3>,
         p: &str,
         pool: bool,
-        active_idx: Option<&Tensor<1, burn::tensor::Int>>,
+        active_mask: Option<&ActiveMask>,
         total_pixels: usize,
     ) -> Tensor<3> {
-        let [_, n, c] = x.dims();
-        let _profile = crate::profile::span(&self.device, || format!("masked-set/{p} pixels={total_pixels} active={} lights={n} C={c}", active_idx.map_or(total_pixels, |idx| idx.dims()[0])));
+        let [_, n, c] = x_gathered.dims();
+        let _profile = crate::profile::span(&self.device, || format!(
+            "masked-set/{p} pixels={total_pixels} active={} padded={} lights={n} C={c}",
+            active_mask.map_or(total_pixels, |m| m.valid_len),
+            active_mask.map_or(total_pixels, |m| m.padded_len),
+        ));
         let out_n = if pool { 1 } else { n };
-        if let Some(idx) = active_idx {
-            let gathered = x.select(0, idx.clone());
-            let processed = self.set_layer(gathered, p, pool);
+        if let Some(mask) = active_mask {
+            let mut processed = self.set_layer(x_gathered, p, pool);
+            if mask.padded_len > mask.valid_len {
+                processed = processed.slice([0..mask.valid_len, 0..out_n, 0..c]);
+            }
             let zeros = Tensor::zeros([total_pixels, out_n, c], self.tensor_options());
-            zeros.select_assign(0, idx.clone(), processed, burn::tensor::IndexingUpdateOp::Add)
+            zeros.select_assign(0, mask.scatter_idx.clone(), processed, burn::tensor::IndexingUpdateOp::Add)
         } else {
-            self.set_layer(x, p, pool)
+            self.set_layer(x_gathered, p, pool)
         }
+    }
+
+    /// Pre-warm and compile all unique GPU kernels (spatial attention, convolutions, norms,
+    /// set-transformer GEMMs, and decoder up-blocks) for both Net_first and Net_stage.
+    pub fn warmup(&self, lights: usize) -> Result<()> {
+        let lights = lights.min(self.options.encoder_batch).max(1);
+
+        // 1. Warm Net_first (32x32 global coarse stage)
+        let dummy_first = Tensor::zeros([lights, 3, 32, 32], self.tensor_options());
+        let mask32 = vec![true; 32 * 32];
+        let _ = self.forward_masked(dummy_first, false, Some(&mask32))?;
+
+        // 2. Warm Net_stage (256x256 patch refinement stage)
+        // With an active circular mask to exercise foreground token gathering and set-transformer buckets
+        let dummy_stage = Tensor::zeros([lights, 6, 256, 256], self.tensor_options());
+        let mut mask256 = vec![false; 256 * 256];
+        for y in 32..224 {
+            for x in 32..224 {
+                mask256[y * 256 + x] = true;
+            }
+        }
+        let _ = self.forward_masked(dummy_stage, true, Some(&mask256))?;
+
+        // 3. Ensure all pipeline shader compilations and autotunings complete
+        self.device.sync().ok();
+        Ok(())
     }
 
     pub fn forward(&self, images: Tensor<4>, refinement: bool) -> Result<Tensor<4>> {
@@ -415,6 +566,7 @@ impl Model {
         );
         let root = if refinement { "Net_stage" } else { "Net_first" };
         images = images.cast(self.options.dtype);
+        let batch_limit = effective_pixel_batch(self.options.pixel_batch);
         let mut current_mask: Option<Vec<bool>> = host_mask.map(|m| m.to_vec());
         let mut pools = Vec::new();
         let mut deepest = None;
@@ -449,7 +601,7 @@ impl Model {
                     current_mask = Some(next_mask);
                 }
             }
-            let active_idx = current_mask.as_ref().and_then(|m| {
+            let active_mask = current_mask.as_ref().and_then(|m| {
                 let indices: Vec<i32> = m
                     .iter()
                     .enumerate()
@@ -457,11 +609,34 @@ impl Model {
                     .collect();
                 // Only use gather/scatter when it saves at least 10% of pixels and is non-empty
                 if !indices.is_empty() && indices.len() * 10 < m.len() * 9 {
-                    let len = indices.len();
-                    Some(Tensor::<1, burn::tensor::Int>::from_data(
-                        TensorData::new(indices, [len]),
+                    let valid_len = indices.len();
+                    let full_chunks = (valid_len / batch_limit) * batch_limit;
+                    let rem = valid_len - full_chunks;
+                    let padded_len = if rem == 0 {
+                        valid_len
+                    } else {
+                        full_chunks + static_bucket_size(rem, batch_limit)
+                    };
+                    let scatter_idx = Tensor::<1, burn::tensor::Int>::from_data(
+                        TensorData::new(indices.clone(), [valid_len]),
                         &self.device,
-                    ))
+                    );
+                    let gather_idx = if padded_len > valid_len {
+                        let mut padded = indices;
+                        padded.resize(padded_len, 0);
+                        Tensor::<1, burn::tensor::Int>::from_data(
+                            TensorData::new(padded, [padded_len]),
+                            &self.device,
+                        )
+                    } else {
+                        scatter_idx.clone()
+                    };
+                    Some(ActiveMask {
+                        gather_idx,
+                        scatter_idx,
+                        valid_len,
+                        padded_len,
+                    })
                 } else {
                     None
                 }
@@ -499,7 +674,7 @@ impl Model {
                     );
                 }
                 encoded_chunks.push(self.norm(z, &format!("{root}.norm{}", i + 1)));
-                crate::execution::finish(&self.device);
+                crate::execution::flush(&self.device);
             }
             let encoded = if encoded_chunks.len() == 1 {
                 encoded_chunks.pop().unwrap()
@@ -507,13 +682,19 @@ impl Model {
                 Tensor::cat(encoded_chunks, 0)
             };
             let x = encoded.permute([1, 0, 2]);
+            // Gather foreground tokens ONCE per stage and share between pool_block and light_block.
+            let x_gathered = if let Some(ref mask) = active_mask {
+                x.select(0, mask.gather_idx.clone())
+            } else {
+                x
+            };
             let pool = self
-                .set_layer_masked(x.clone(), &format!("{root}.pool_block{}", i + 1), true, active_idx.as_ref(), oh * ow)
+                .set_layer_pre_gathered(x_gathered.clone(), &format!("{root}.pool_block{}", i + 1), true, active_mask.as_ref(), oh * ow)
                 .reshape([1, oh, ow, c])
                 .permute([0, 3, 1, 2]);
             if i < 3 {
                 images = self
-                    .set_layer_masked(x, &format!("{root}.light_block{}", i + 1), false, active_idx.as_ref(), oh * ow)
+                    .set_layer_pre_gathered(x_gathered, &format!("{root}.light_block{}", i + 1), false, active_mask.as_ref(), oh * ow)
                     .permute([1, 2, 0])
                     .reshape([lights, c, oh, ow]);
                 pools.push(pool);
@@ -528,8 +709,8 @@ impl Model {
             let p = format!("{root}.up_block{}.0", i + 1);
             x = module::conv_transpose2d(
                 x,
-                self.w(&format!("{p}.weight")),
-                Some(self.w(&format!("{p}.bias"))),
+                self.w4(&format!("{p}.weight")),
+                Some(self.w1(&format!("{p}.bias"))),
                 ConvTransposeOptions::new([2; 2], [1; 2], [0; 2], [1; 2], 1),
             );
             x = activation::leaky_relu(x, 0.1);

@@ -1,8 +1,21 @@
 use crate::model::{Model, read_tensor, tensor};
 use anyhow::{Context, Result, ensure};
 use burn::tensor::{Bool, Tensor, TensorData};
+use burn_backend::{DType, ExecutionError};
+use burn_cubecl::{
+    CubeBackend,
+    fusion::{CubeFusionHandle, FusionCubeRuntime},
+    ops::numeric::empty_device_contiguous_dtype,
+};
+use burn_fusion::{
+    Fusion,
+    custom::{CustomOpIr, HandleContainer, Operation, OperationIr, OperationOutput, StreamId, TensorIr},
+};
+use cubecl::prelude::*;
 use image::{ImageBuffer, Rgb};
 use std::path::{Path, PathBuf};
+
+type Gpu = Fusion<CubeBackend>;
 
 /// Host CHW image; preprocessing keeps the reference's BGR channel convention.
 #[derive(Clone)]
@@ -36,6 +49,25 @@ impl Raster {
     /// PyTorch bilinear coordinates, including align_corners=True for normal maps.
     pub fn resize(&self, h: usize, w: usize, align: bool) -> Self {
         let mut out = Self::zeros(self.c, h, w);
+        // Fast path for exact 2x pyramid downsampling with align_corners=False:
+        // coord(i, 2*dst, dst) = 2*i + 0.5, so dx = dy = 0.5 everywhere.
+        if !align && self.h == h * 2 && self.w == w * 2 {
+            for c in 0..self.c {
+                let src_c = &self.data[c * self.h * self.w..(c + 1) * self.h * self.w];
+                let dst_c = &mut out.data[c * h * w..(c + 1) * h * w];
+                for y in 0..h {
+                    let row0 = &src_c[(2 * y) * self.w..(2 * y + 1) * self.w];
+                    let row1 = &src_c[(2 * y + 1) * self.w..(2 * y + 2) * self.w];
+                    let dst_row = &mut dst_c[y * w..(y + 1) * w];
+                    for x in 0..w {
+                        let x2 = 2 * x;
+                        dst_row[x] = (row0[x2] * 0.5 + row0[x2 + 1] * 0.5) * 0.5
+                            + (row1[x2] * 0.5 + row1[x2 + 1] * 0.5) * 0.5;
+                    }
+                }
+            }
+            return out;
+        }
         let coord = |i: usize, src: usize, dst: usize| {
             if align {
                 if dst == 1 {
@@ -243,20 +275,136 @@ enum ImageLevel<'a> {
 }
 
 fn upload_images(model: &Model, images: &[Raster]) -> Tensor<4> {
+    use rayon::prelude::*;
     let _profile = crate::profile::span(&model.device, || format!("input/upload images={} size={}x{}", images.len(), images[0].h, images[0].w));
     let h = images[0].h;
     let w = images[0].w;
     let shape = [images.len(), 3, h, w];
-    // One transfer, already in the target precision. The previous loop uploaded
-    // FP32 then cast and slice-assigned every photograph separately on the GPU.
+    // One transfer, already converted in parallel on the CPU to the target precision.
     if model.options.dtype == burn::tensor::FloatDType::F16 {
-        let values: Vec<half::f16> = images.iter().flat_map(|im| im.data.iter())
-            .map(|&v| half::f16::from_f32(v)).collect();
+        let values: Vec<half::f16> = images
+            .par_iter()
+            .flat_map_iter(|im| im.data.iter().map(|&v| half::f16::from_f32(v)))
+            .collect();
         Tensor::from_data(TensorData::new(values, shape), model.tensor_options())
     } else {
         let values: Vec<f32> = images.iter().flat_map(|im| im.data.iter().copied()).collect();
         tensor(values, shape, &model.device)
     }
+}
+
+#[cube(launch)]
+fn upsample2x_align_kernel<F: Float>(
+    input: &cubecl::prelude::Tensor<F>,
+    output: &mut cubecl::prelude::Tensor<F>,
+    #[comptime] channels: usize,
+) {
+    let idx = usize::cast_from(CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * usize::cast_from(CUBE_DIM)
+        + usize::cast_from(UNIT_POS);
+    let out_w = output.shape(3);
+    let out_h = output.shape(2);
+    let in_w = input.shape(3);
+    let in_h = input.shape(2);
+    let total_pixels = out_h * out_w;
+    let total = channels * total_pixels;
+
+    if idx < total {
+        let c = idx / total_pixels;
+        let p_idx = idx % total_pixels;
+        let y = p_idx / out_w;
+        let x = p_idx % out_w;
+
+        let fy = (y as f32) * ((in_h - 1) as f32) / ((out_h - 1) as f32);
+        let fx = (x as f32) * ((in_w - 1) as f32) / ((out_w - 1) as f32);
+
+        let y0 = usize::min(fy as usize, in_h - 1);
+        let y1 = usize::min(y0 + 1, in_h - 1);
+        let dy = fy - (y0 as f32);
+
+        let x0 = usize::min(fx as usize, in_w - 1);
+        let x1 = usize::min(x0 + 1, in_w - 1);
+        let dx = fx - (x0 as f32);
+
+        let in_c_stride = input.stride(1);
+        let in_h_stride = input.stride(2);
+        let in_base = c * in_c_stride;
+
+        let v00 = f32::cast_from(input[in_base + y0 * in_h_stride + x0]);
+        let v01 = f32::cast_from(input[in_base + y0 * in_h_stride + x1]);
+        let v10 = f32::cast_from(input[in_base + y1 * in_h_stride + x0]);
+        let v11 = f32::cast_from(input[in_base + y1 * in_h_stride + x1]);
+
+        let top = v00 * (1.0 - dx) + v01 * dx;
+        let bottom = v10 * (1.0 - dx) + v11 * dx;
+        let val = top * (1.0 - dy) + bottom * dy;
+
+        let out_c_stride = output.stride(1);
+        let out_h_stride = output.stride(2);
+        output[c * out_c_stride + y * out_h_stride + x] = F::cast_from(val);
+    }
+}
+
+#[derive(Debug)]
+struct Upsample2xOp {
+    desc: CustomOpIr,
+}
+
+impl Operation<FusionCubeRuntime> for Upsample2xOp {
+    fn execute(&self, handles: &mut HandleContainer<CubeFusionHandle>) -> Result<(), ExecutionError> {
+        let ([input], [output]) = self.desc.as_fixed();
+        let input = handles.get_float_tensor::<CubeBackend>(input);
+        let [b, c, h, w] = input.meta.shape().dims::<4>();
+        let client = input.client.clone();
+        let total = c * (2 * h) * (2 * w);
+        let count = CubeCount::Static((total.div_ceil(128)) as u32, 1, 1);
+        let dim = CubeDim::new_1d(128);
+        let out_shape = [b, c, 2 * h, 2 * w];
+        let result = empty_device_contiguous_dtype(
+            client.clone(),
+            input.device.clone(),
+            burn::tensor::Shape::new(out_shape),
+            input.dtype,
+        );
+        match input.dtype {
+            DType::F16 => upsample2x_align_kernel::launch::<half::f16>(
+                &client, count, dim,
+                input.into_tensor_arg(),
+                result.clone().into_tensor_arg(),
+                c,
+            ),
+            DType::F32 => upsample2x_align_kernel::launch::<f32>(
+                &client, count, dim,
+                input.into_tensor_arg(),
+                result.clone().into_tensor_arg(),
+                c,
+            ),
+            _ => return Err(ExecutionError::generic("Unsupported upsample dtype")),
+        }
+        handles.register_float_tensor::<CubeBackend>(&output.id, result);
+        Ok(())
+    }
+}
+
+fn resize_normal_2x(x: Tensor<4>, h: usize, w: usize) -> Tensor<4> {
+    let [b, c, in_h, in_w] = x.dims();
+    if h == in_h * 2 && w == in_w * 2 && b == 1 {
+        if let Ok(prim) = x.clone().inner().try_into_primitive::<Gpu>() {
+            let client = prim.client.clone();
+            let out_shape = burn::tensor::Shape::new([b, c, h, w]);
+            let out = TensorIr::uninit(client.create_empty_handle(), out_shape, prim.dtype);
+            let desc = CustomOpIr::with_scalars(
+                "unimsps_upsample2x_align",
+                &[prim.into_ir()],
+                &[out],
+                vec![],
+            );
+            let [out] = client
+                .register(StreamId::current(), OperationIr::Custom(desc.clone()), Upsample2xOp { desc })
+                .outputs();
+            return Tensor::from_primitive::<Gpu>(out);
+        }
+    }
+    resize_device(x, h, w, true)
 }
 
 fn resize_device(x: Tensor<4>, h: usize, w: usize, align_corners: bool) -> Tensor<4> {
@@ -291,21 +439,18 @@ pub fn process(model: &Model, input: &Input) -> Result<Raster> {
 pub fn process_with_options(model: &Model, input: &Input, options: ProcessOptions) -> Result<Raster> {
     use std::borrow::Cow;
     use rayon::prelude::*;
-    use burn::tensor::FloatDType;
 
     let prepare_profile = crate::profile::phase(&model.device, || "pyramid/build-inputs-masks-and-weights".into());
     let stages = input.size.ilog2() as usize - 4;
     let budget = (options.image_cache_mib as u64).saturating_mul(1024 * 1024);
-    let element_bytes = if model.options.dtype == FloatDType::F16 { 2u64 } else { 4u64 };
+    let element_bytes = if model.options.dtype == burn::tensor::FloatDType::F16 { 2u64 } else { 4u64 };
     let rgb_bytes = |size: usize| (input.images.len() as u64)
         .saturating_mul(3).saturating_mul(size as u64)
         .saturating_mul(size as u64).saturating_mul(element_bytes);
-    let whole_pyramid_fits = rgb_bytes(input.size).saturating_mul(4) / 3 <= budget;
-    let mut levels = if whole_pyramid_fits {
-        vec![ImageLevel::Device(upload_images(model, &input.images))]
-    } else {
-        vec![ImageLevel::Host(Cow::Borrowed(input.images.as_slice()))]
-    };
+    // Build the RGB image pyramid on the host using parallel 2x2 bilinear box downsampling,
+    // avoiding 5 multi-scale WGPU bilinear shader compilations (~6.5s) and keeping only the
+    // active scale resident in VRAM at a time.
+    let mut levels = vec![ImageLevel::Host(Cow::Borrowed(input.images.as_slice()))];
     let mut masks = vec![input.mask.clone()];
     let mut size = input.size;
     while size > 32 {
@@ -367,12 +512,14 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
         eprintln!("Scale {}/{}: {} x {} ({})", i + 1, stages, size, size,
             if matches!(&active, ImageLevel::Device(_)) { "RGB cached on device" } else { "streaming RGB patches" });
         let prior_profile = crate::profile::span(&model.device, || format!("normal/resize size={size}"));
-        let prior = normal.take().map(|n| crate::model::normalize(resize_device(n, size, size, true))
+        let prior = normal.take().map(|n| crate::model::normalize(resize_normal_2x(n, size, size))
             .cast(model.options.dtype));
         drop(prior_profile);
         normal = Some(if i < 4 {
             let ImageLevel::Device(images) = active else { unreachable!() };
-            stage_device(model, images, prior, mask.clone(), Some(&host_mask))?
+            let res = stage_device(model, images, prior, mask.clone(), Some(&host_mask))?;
+            crate::execution::trim_memory(&model.device);
+            res
         } else {
             let prior = prior.context("Refinement requires previous normals")?;
             let mut out = Tensor::zeros([1, 3, size, size], model.tensor_options());
@@ -417,12 +564,14 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     let updated = out.clone().slice(region.clone()) + weighted;
                     out = out.slice_assign(region, updated);
                     drop(blend_profile);
-                    // Submit outstanding fusion work without waiting for GPU completion.
+                    // Submit outstanding fusion work and bound pool reservation without per-chunk stalls.
                     model.device.flush().map_err(|e| anyhow::anyhow!("GPU submission failed: {e:?}"))?;
-                    crate::execution::finish(&model.device);
+                    crate::execution::trim_memory(&model.device);
+                    crate::execution::checkpoint(&model.device, count);
                     eprintln!("  Patch {count}/{total} {}", if crate::execution::depth() != 0 || crate::profile::enabled() { "completed" } else { "queued" });
                 }
             }
+            crate::execution::finish(&model.device);
             out
         });
         if i + 1 == stages { final_mask = Some(mask); }

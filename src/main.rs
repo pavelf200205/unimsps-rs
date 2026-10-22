@@ -13,8 +13,8 @@ struct Cli {
     /// Detailed synchronized CPU/GPU wall timings; writes profile.json. Slows execution.
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
-    /// Maximum chunks queued between GPU waits; 0 restores unrestricted submission.
-    #[arg(long, default_value_t = 2, global = true)]
+    /// Maximum chunks queued between synchronous GPU waits; 0 uses asynchronous submission.
+    #[arg(long, default_value_t = 0, global = true)]
     queue_depth: usize,
     #[arg(long)]
     cpu: bool,
@@ -23,9 +23,10 @@ struct Cli {
     /// Auto selects WGPU on every build. CUDA is only used when explicitly requested.
     #[arg(long,default_value="auto",value_parser=["auto","cuda","vulkan","dx12","metal"])]
     api: String,
-    #[arg(long, default_value_t = 5000)]
+    /// Set-transformer pixel batch size (defaults to power-of-two 4096 to avoid shape explosion).
+    #[arg(long, default_value_t = 4096)]
     pixel_batch: usize,
-    /// Spatial flash query limit; 0 uses one dispatch. Unfused scores remain bounded.
+    /// Spatial attention query limit; 0 uses one fused dispatch. Unfused scores remain bounded.
     #[arg(long, default_value_t = 0)]
     query_batch: usize,
     #[arg(long, default_value_t = 8)]
@@ -39,6 +40,9 @@ struct Cli {
     /// Use explicit matmul/softmax spatial attention instead of fused SDPA dispatch.
     #[arg(long)]
     unfused_attention: bool,
+    /// Skip pipeline and GPU kernel pre-warm pass before timed inference.
+    #[arg(long)]
+    no_warmup: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -70,6 +74,7 @@ enum Command {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    eprintln!("unimsps 0.1.1 (WGPU fused-subgroup spatial/light/norm + static-bucket build)");
     unimsps::profile::configure(cli.verbose);
     unimsps::execution::configure(cli.queue_depth);
     ensure!(!(cli.integrated && cli.api == "cuda"), "--integrated cannot select CUDA");
@@ -99,7 +104,7 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("GPU initialization: {e:?}"))?
     };
     eprintln!("Device: {:?}", device.identity());
-    eprintln!("Queue depth: {} (0 = unrestricted)", cli.queue_depth);
+    eprintln!("Queue depth: {} (0 = asynchronous flush)", cli.queue_depth);
     match cli.command {
         Command::Doctor => {
             let x = tensor(vec![1., 2., 3., 4.], [2, 2], &device);
@@ -141,7 +146,14 @@ fn main() -> Result<()> {
                 fused_attention: !cli.unfused_attention,
             })?;
             drop(load_profile);
-            eprintln!("Precision: {dtype:?}; encoder batch: {}; pixel batch: {}", cli.encoder_batch, cli.pixel_batch);
+            eprintln!("Precision: {dtype:?}; encoder batch: {}; pixel batch: {}", cli.encoder_batch, net.options.pixel_batch);
+            if !cli.no_warmup && !cli.cpu {
+                eprintln!("Pre-warming GPU kernels (spatial attention, GEMMs, norms, decoders)...");
+                let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/pipeline".into());
+                net.warmup(cli.encoder_batch)?;
+                drop(warmup_profile);
+                eprintln!("Warmup complete.");
+            }
             for object in objects {
                 let out = if batch {
                     out.join(
@@ -175,7 +187,7 @@ fn main() -> Result<()> {
                 std::fs::write(
                     out.join("metadata.json"),
                     serde_json::to_vec_pretty(
-                        &serde_json::json!({"width":normal.w,"height":normal.h,"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"encoder_batch":cli.encoder_batch,"pixel_batch":cli.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
+                        &serde_json::json!({"width":normal.w,"height":normal.h,"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"encoder_batch":cli.encoder_batch,"pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
                     )?,
                 )?;
                 println!(
@@ -187,7 +199,7 @@ fn main() -> Result<()> {
                     "device": format!("{:?}", net.device.identity()), "api": cli.api,
                     "precision": format!("{dtype:?}"), "images": input.images.len(),
                     "padded_size": input.size, "encoder_batch": cli.encoder_batch,
-                    "pixel_batch": cli.pixel_batch, "query_batch": cli.query_batch,
+                    "pixel_batch": net.options.pixel_batch, "query_batch": cli.query_batch,
                     "image_cache_mib": cli.image_cache_mib, "unfused_attention": cli.unfused_attention,
                     "queue_depth": cli.queue_depth,
                     "object": object, "model": model,
