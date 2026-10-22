@@ -1,0 +1,13 @@
+/target/
+/dist/
+/runs/
+/experiments/
+/weights/
+__pycache__/
+*.pyc
+*.pyo
+*.pth
+*.safetensors
+*.f32
+/.cargo/
+unimsps-rs.zip
