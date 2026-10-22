@@ -56,6 +56,9 @@ pub struct ModelOptions {
     pub query_batch: usize,
     pub fused_attention: bool,
     pub score_budget_mib: usize,
+    pub fused_softmax: bool,
+    pub optimized_encoder: bool,
+    pub gemm_convolutions: bool,
 }
 impl Default for ModelOptions {
     fn default() -> Self {
@@ -66,6 +69,9 @@ impl Default for ModelOptions {
             query_batch: 0,
             fused_attention: false,
             score_budget_mib: 512,
+            fused_softmax: true,
+            optimized_encoder: true,
+            gemm_convolutions: true,
         }
     }
 }
@@ -216,6 +222,30 @@ impl Model {
             raw_f32.insert(format!("{prefix}.fc_kv.bias"), (vec![2 * output], k_b));
         }
 
+        // Prepack targeted dense convolutions with channel-inner patch reduction order.
+        // Retain original kernels for the selectable Burn path and unsupported devices.
+        if options.gemm_convolutions {
+            let names: Vec<String> = raw_f32.keys().filter(|name|
+                name.ends_with(".attn.sr.weight") ||
+                (2..=4).any(|stage| name.ends_with(&format!(".patch_embed{stage}.proj.weight")))
+            ).cloned().collect();
+            for name in names {
+                let (shape, values) = &raw_f32[&name];
+                let output = shape[0];
+                let reduction = shape[1] * shape[2] * shape[3];
+                let mut packed = vec![0.0_f32; values.len()];
+                for o in 0..output {
+                    for k in 0..reduction {
+                        let channel = k % shape[1];
+                        let spatial = k / shape[1];
+                        let source = channel * shape[2] * shape[3] + spatial;
+                        packed[k * output + o] = values[o * reduction + source];
+                    }
+                }
+                raw_f32.insert(name.replace(".weight", ".gemm_weight"), (vec![reduction, output], packed));
+            }
+        }
+
         // Store all weights in their native rank so runtime lookups clone the handle
         // directly without recording thousands of Reshape nodes into Burn's Fusion IR.
         let mut weights = BTreeMap::new();
@@ -263,12 +293,14 @@ impl Model {
         let [b, n, _] = x.dims();
         // In the light transformers b is thousands and n is often only 6-20.
         // Flattening produces one GEMM instead of thousands of tiny batched GEMMs.
-        let y = x.reshape([b * n, i]).matmul(w);
         let bias_key = format!("{p}.bias");
-        let y = if self.weights.contains_key(&bias_key) {
-            y + self.w1(&bias_key).reshape([1, o])
+        let bias = self.weights.contains_key(&bias_key).then(|| self.w1(&bias_key));
+        // Preserve one large GEMM and expose bias through Burn's linear IR.
+        let y = if self.options.optimized_encoder {
+            module::linear(x.reshape([b * n, i]), w, bias)
         } else {
-            y
+            let y = x.reshape([b * n, i]).matmul(w);
+            if let Some(bias) = bias { y + bias.reshape([1, o]) } else { y }
         };
         y.reshape([b, n, o])
     }
@@ -290,6 +322,44 @@ impl Model {
             ConvOptions::new([stride; 2], [pad; 2], [1; 2], groups),
         )
     }
+    /// Target dense convolutions without materializing NCHW inputs or outputs.
+    fn conv_tokens(&self, x: Tensor<3>, p: &str, h: usize, w: usize, kernel: usize, stride: usize, pad: usize) -> Tensor<3> {
+        let [batch, tokens, channels] = x.dims();
+        assert_eq!(tokens, h * w);
+        let oh = (h + 2 * pad - kernel) / stride + 1;
+        let ow = (w + 2 * pad - kernel) / stride + 1;
+        let packed_key = format!("{p}.gemm_weight");
+        if !self.options.gemm_convolutions || !self.weights.contains_key(&packed_key) || !crate::conv_gemm::supported(&x) {
+            let y = self.conv(x.swap_dims(1, 2).reshape([batch, channels, h, w]), p, stride, pad, 1);
+            let output = y.dims()[1];
+            return y.reshape([batch, output, oh * ow]).swap_dims(1, 2);
+        }
+        let _profile = crate::profile::span(&self.device, || format!("conv-gemm/{p} B={batch} H={h} W={w} K={kernel} stride={stride}"));
+        let weight = self.w2(&packed_key);
+        let output = weight.dims()[1];
+        let bias = self.w1(&format!("{p}.bias"));
+        let rows = batch * oh * ow;
+        let bytes = if self.options.dtype == FloatDType::F16 { 2 } else { 4 };
+        // Each packed workspace is at most 16 MiB (not a total VRAM cap).
+        let limit = (16 * 1024 * 1024 / (channels * kernel * kernel * bytes)).max(1);
+        let chunk_rows = (1usize << limit.ilog2()).min(rows);
+        crate::profile::event(|| format!("conv/gemm {p} chunk_rows={chunk_rows} reduction={}", channels * kernel * kernel));
+        let mut result = if chunk_rows < rows { Some(Tensor::<2>::empty([rows, output], self.tensor_options())) } else { None };
+        for start in (0..rows).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(rows);
+            let pack_profile = crate::profile::span(&self.device, || format!("conv-pack/{p} rows={}", end - start));
+            let patches = crate::conv_gemm::patches(x.clone(), h, w, kernel, stride, pad, start, end - start);
+            drop(pack_profile);
+            let gemm_profile = crate::profile::span(&self.device, || format!("conv-matmul/{p} rows={}", end - start));
+            let value = module::linear(patches, weight.clone(), Some(bias.clone()));
+            drop(gemm_profile);
+            if result.is_none() { return value.reshape([batch, oh * ow, output]); }
+            result = Some(result.take().unwrap().slice_assign([start..end, 0..output], value));
+            crate::execution::flush(&self.device);
+        }
+        result.unwrap().reshape([batch, oh * ow, output])
+    }
+
     /// Consumes `q` `[b, n, c]` and packed `kv` `[b, m, 2 * c]` directly on the fused subgroup
     /// paths, only slicing `kv` into separate `k` and `v` tensors when falling back to CMMA flash or GEMM.
     fn attention_packed(
@@ -361,8 +431,16 @@ impl Model {
                     return out;
                 }
             }
+            let qk_profile = crate::profile::span(&self.device, || format!("attention/qk-gemm Q={:?} K={m}", q.dims()));
             let scores = (q * scale).matmul(kt.clone());
-            activation::softmax(scores, 3).matmul(v.clone())
+            drop(qk_profile);
+            let softmax_profile = crate::profile::span(&self.device, || format!("attention/softmax shape={:?}", scores.dims()));
+            let probabilities = if self.options.fused_softmax {
+                crate::softmax::forward(scores)
+            } else { activation::softmax(scores, 3) };
+            drop(softmax_profile);
+            let _av_profile = crate::profile::span(&self.device, || format!("attention/av-gemm probabilities={:?}", probabilities.dims()));
+            probabilities.matmul(v.clone())
         };
         let elem_bytes = if self.options.dtype == FloatDType::F16 { 2 } else { 4 };
         let score_limit = (self.options.score_budget_mib.max(1) * 1024 * 1024usize / (b * heads * m * elem_bytes)).max(1);
@@ -393,40 +471,41 @@ impl Model {
         sr: usize,
     ) -> Tensor<3> {
         let [b, n, c] = x.dims();
+        let _block_profile = crate::profile::span(&self.device, || format!("encoder-block/{p} B={b} N={n} C={c}"));
         let z = self.norm(x.clone(), &format!("{p}.norm1"));
         let q = self.linear(z.clone(), &format!("{p}.attn.q"));
         let z = if sr > 1 {
-            let a = self.conv(
-                z.swap_dims(1, 2).reshape([b, c, h, w]),
-                &format!("{p}.attn.sr"),
-                sr,
-                0,
-                1,
-            );
-            let [_, _, hh, ww] = a.dims();
-            self.norm(
-                a.reshape([b, c, hh * ww]).swap_dims(1, 2),
-                &format!("{p}.attn.norm"),
-            )
+            let _reduction_profile = crate::profile::span(&self.device, || format!("encoder/spatial-reduction {p} stride={sr}"));
+            let a = self.conv_tokens(z, &format!("{p}.attn.sr"), h, w, sr, sr, 0);
+            self.norm(a, &format!("{p}.attn.norm"))
         } else {
             z
         };
         let kv = self.linear(z, &format!("{p}.attn.kv"));
         let a = self.attention_packed(q, kv, heads, 1.0 / (c as f32 / heads as f32).sqrt(), true);
-        let x = x + self.linear(a, &format!("{p}.attn.proj"));
+        let projected = self.linear(a, &format!("{p}.attn.proj"));
+        let residual_profile = crate::profile::span(&self.device, || format!("encoder/attention-residual {p}"));
+        let x = x + projected;
+        drop(residual_profile);
         let z = self.linear(
             self.norm(x.clone(), &format!("{p}.norm2")),
             &format!("{p}.mlp.fc1"),
         );
-        let z = self.conv(
-            z.swap_dims(1, 2).reshape([b, 4 * c, h, w]),
-            &format!("{p}.mlp.dwconv.dwconv"),
-            1,
-            1,
-            4 * c,
-        );
-        let z = activation::gelu(z.reshape([b, 4 * c, n]).swap_dims(1, 2));
-        x + self.linear(z, &format!("{p}.mlp.fc2"))
+        let depthwise_profile = crate::profile::span(&self.device, || format!("mlp/depthwise-gelu {p} input={:?}", z.dims()));
+        let dw = format!("{p}.mlp.dwconv.dwconv");
+        let fused = if self.options.optimized_encoder {
+            crate::depthwise::forward(z.clone(), self.w4(&format!("{dw}.weight")), self.w1(&format!("{dw}.bias")), h, w)
+        } else { None };
+        let z = if let Some(out) = fused {
+            out
+        } else {
+            let conv = self.conv(z.swap_dims(1, 2).reshape([b, 4 * c, h, w]), &dw, 1, 1, 4 * c);
+            activation::gelu(conv.reshape([b, 4 * c, n]).swap_dims(1, 2))
+        };
+        drop(depthwise_profile);
+        let projected = self.linear(z, &format!("{p}.mlp.fc2"));
+        let _residual_profile = crate::profile::span(&self.device, || format!("encoder/mlp-residual {p}"));
+        x + projected
     }
     fn mab(&self, x: Tensor<3>, y: Tensor<3>, p: &str, preprojected_q: bool) -> Tensor<3> {
         let q = if preprojected_q {
@@ -583,6 +662,7 @@ impl Model {
             let c = [64, 128, 256, 512][i];
             let oh = if i == 0 { ih } else { ih / 2 };
             let ow = if i == 0 { iw } else { iw / 2 };
+            let mask_profile = crate::profile::span(&self.device, || format!("mask/prepare-stage {}", i + 1));
             if i > 0 {
                 if let Some(prev) = current_mask.take() {
                     // Downsample mask by 2x (max-pooling 3x3 stride 2 pad 1 to match conv3x3 stride 2)
@@ -648,6 +728,7 @@ impl Model {
                 }
             });
 
+            drop(mask_profile);
             let mut encoded_chunks = Vec::with_capacity((lights + self.options.encoder_batch - 1) / self.options.encoder_batch);
             for light in (0..lights).step_by(self.options.encoder_batch) {
                 let end = (light + self.options.encoder_batch).min(lights);
@@ -657,18 +738,16 @@ impl Model {
                 } else {
                     images.clone().slice([light..end, 0..ic, 0..ih, 0..iw])
                 };
-                let z = self.conv(
-                    input_batch,
-                    &format!("{p}.proj"),
-                    if i == 0 { 1 } else { 2 },
-                    1,
-                    1,
-                );
-                let [_, c, hh, ww] = z.dims();
-                let mut z = self.norm(
-                    z.reshape([batch, c, hh * ww]).swap_dims(1, 2),
-                    &format!("{p}.norm"),
-                );
+                let (z, hh, ww) = if i > 0 {
+                    let tokens = input_batch.reshape([batch, ic, ih * iw]).swap_dims(1, 2);
+                    (self.conv_tokens(tokens, &format!("{p}.proj"), ih, iw, 3, 2, 1), oh, ow)
+                } else {
+                    // Keep the cheap first embedding on Burn's existing path.
+                    let z = self.conv(input_batch, &format!("{p}.proj"), 1, 1, 1);
+                    let [_, c, hh, ww] = z.dims();
+                    (z.reshape([batch, c, hh * ww]).swap_dims(1, 2), hh, ww)
+                };
+                let mut z = self.norm(z, &format!("{p}.norm"));
                 for j in 0..[3, 4, 6, 3][i] {
                     z = self.block(
                         z,
@@ -687,6 +766,7 @@ impl Model {
             } else {
                 Tensor::cat(encoded_chunks, 0)
             };
+            let gather_profile = crate::profile::span(&self.device, || format!("layout/foreground-gather stage={}", i + 1));
             let x = encoded.permute([1, 0, 2]);
             // Gather foreground tokens ONCE per stage and share between pool_block and light_block.
             let x_gathered = if let Some(ref mask) = active_mask {
@@ -694,6 +774,7 @@ impl Model {
             } else {
                 x
             };
+            drop(gather_profile);
             let pool = self
                 .set_layer_pre_gathered(x_gathered.clone(), &format!("{root}.pool_block{}", i + 1), true, active_mask.as_ref(), oh * ow)
                 .reshape([1, oh, ow, c])

@@ -96,12 +96,11 @@ impl Operation<FusionCubeRuntime> for NormOp {
         if gy > hw.max_cube_count.1 as usize {
             return Err(ExecutionError::generic("LayerNorm dispatch exceeds device grid limits"));
         }
-        let result = empty_device_contiguous_dtype(
-            client.clone(),
-            x.device.clone(),
-            x.meta.shape().clone(),
-            x.dtype,
-        );
+        let reuse = x.can_mut() && **x.meta.strides() == [seq * channels, channels, 1];
+        let result = if reuse { x.clone() } else {
+            empty_device_contiguous_dtype(client.clone(), x.device.clone(), x.meta.shape().clone(), x.dtype)
+        };
+        crate::profile::event(|| format!("norm/subgroup in_place={reuse}"));
         let count = CubeCount::Static(gx as u32, gy as u32, 1);
         let dim = CubeDim::new_1d(128);
         let inv_c = 1.0f32 / (channels as f32);

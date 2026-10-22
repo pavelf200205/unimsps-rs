@@ -4,9 +4,13 @@ use burn::tensor::Device;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static POOL_CACHE_BYTES: AtomicUsize = AtomicUsize::new(1536 * 1024 * 1024);
 
 pub fn configure(depth: usize) { QUEUE_DEPTH.store(depth, Ordering::Relaxed); }
 pub fn depth() -> usize { QUEUE_DEPTH.load(Ordering::Relaxed) }
+pub fn configure_pool_cache(mib: usize) {
+    POOL_CACHE_BYTES.store(mib.saturating_mul(1024 * 1024), Ordering::Relaxed);
+}
 
 pub(crate) fn checkpoint(device: &Device, completed: usize) {
     let depth = depth();
@@ -28,12 +32,14 @@ pub(crate) fn flush(device: &Device) {
 }
 
 pub(crate) fn trim_memory(device: &Device) {
-    // Borrowed from supernormal-rs: reclaim unused allocator pool reservations only when
-    // reserved bytes exceed 1.5 GiB instead of stalling on every chunk.
+    let threshold = POOL_CACHE_BYTES.load(Ordering::Relaxed);
+    if threshold == 0 { return; }
+    let _profile = crate::profile::span(device, || "allocator/check-and-trim".into());
     let _ = device.flush();
     if let Some(usage) = device.memory_pool_usage() {
-        if usage.bytes_reserved > 1536 * 1024 * 1024 {
-            let _ = device.sync();
+        if usage.bytes_reserved > threshold as _ {
+            crate::profile::event(|| format!("allocator/cleanup reserved_mib={}", usage.bytes_reserved / (1024 * 1024)));
+            device.sync().expect("GPU completion failed before allocator cleanup");
             device.memory_cleanup();
         }
     }

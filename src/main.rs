@@ -40,6 +40,18 @@ struct Cli {
     /// Memory budget in MiB for attention score matrix allocation before chunking (default: 512 MiB).
     #[arg(long, default_value_t = 512)]
     score_budget_mib: usize,
+    /// Use Burn's general softmax instead of the dedicated GEMM-attention row kernel.
+    #[arg(long, global = true)]
+    burn_softmax: bool,
+    /// Retain previous matmul+bias and NCHW MLP convolution for timing comparisons.
+    #[arg(long, global = true)]
+    reference_encoder: bool,
+    /// Retain Burn convolution dispatch for spatial reductions and stride-2 embeddings.
+    #[arg(long, global = true)]
+    burn_convolutions: bool,
+    /// Allocator reservation threshold for cleanup; 0 retains cached buffers.
+    #[arg(long, default_value_t = 1536, global = true)]
+    pool_cache_mib: usize,
     /// Force custom subgroup fused spatial attention instead of standard hardware GEMM.
     #[arg(long)]
     fused_attention: bool,
@@ -80,9 +92,10 @@ enum Command {
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    eprintln!("unimsps 0.1.1 (WGPU fused-subgroup spatial/light/norm + static-bucket build)");
+    eprintln!("unimsps 0.1.1 (WGPU native GEMM + row-softmax build)");
     unimsps::profile::configure(cli.verbose);
     unimsps::execution::configure(cli.queue_depth);
+    unimsps::execution::configure_pool_cache(cli.pool_cache_mib);
     ensure!(!(cli.integrated && cli.api == "cuda"), "--integrated cannot select CUDA");
     let use_cuda = cli.api == "cuda";
     let device = if cli.cpu {
@@ -151,6 +164,9 @@ fn main() -> Result<()> {
                 query_batch: cli.query_batch,
                 fused_attention: cli.fused_attention && !cli.unfused_attention,
                 score_budget_mib: cli.score_budget_mib,
+                fused_softmax: !cli.burn_softmax,
+                optimized_encoder: !cli.reference_encoder,
+                gemm_convolutions: !cli.burn_convolutions,
             })?;
             drop(load_profile);
             eprintln!(
@@ -223,7 +239,7 @@ fn main() -> Result<()> {
                 std::fs::write(
                     out.join("metadata.json"),
                     serde_json::to_vec_pretty(
-                        &serde_json::json!({"width":normal.w,"height":normal.h,"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"encoder_batch":cli.encoder_batch,"pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
+                        &serde_json::json!({"width":normal.w,"height":normal.h,"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"encoder_batch":cli.encoder_batch,"pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,"optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,"pool_cache_mib":cli.pool_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
                     )?,
                 )?;
                 println!(
@@ -239,6 +255,7 @@ fn main() -> Result<()> {
                     "image_cache_mib": cli.image_cache_mib, "unfused_attention": !net.options.fused_attention,
                     "fused_attention": net.options.fused_attention, "score_budget_mib": net.options.score_budget_mib,
                     "queue_depth": cli.queue_depth,
+                    "fused_softmax": net.options.fused_softmax, "optimized_encoder": net.options.optimized_encoder, "gemm_convolutions": net.options.gemm_convolutions, "pool_cache_mib": cli.pool_cache_mib,
                     "object": object, "model": model,
                 }))?;
             }

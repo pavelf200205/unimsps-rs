@@ -5,4 +5,9 @@ mod attention;
 mod light_attention;
 mod norm;
 pub mod profile;
+mod softmax;
 pub mod execution;
+
+mod depthwise;
+
+mod conv_gemm;

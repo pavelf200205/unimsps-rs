@@ -88,3 +88,76 @@ without CMMA configurations, and partial light-batch shape buckets of 256 pixels
 The --queue-depth option isolates scheduling behavior: 0 disables the added
 waits; verbose mode already synchronizes more finely. Normal metadata and profile
 context record queue depth. No builds or inference were run for this revision.
+
+## Follow-up after the user-reported 50–55-second improvements
+
+Preserved native GEMM as default, 65536 pixel batches, 512 MiB score budget,
+packed weights/KV, precomputed pooling queries, fused LayerNorm, foreground
+gather sharing and asynchronous submission. Added a dedicated row-softmax
+kernel with FP32 max/sum and conditional in-place score-buffer reuse. The two
+GEMMs remain unchanged. Unsupported devices/shapes retain Burn softmax; the
+--burn-softmax flag explicitly selects it.
+
+Allocator cleanup was invoked at each patch boundary once reservations exceeded
+1536 MiB. This may discard useful reusable allocations; its significance cannot
+be established from older profiles. Added a configurable --pool-cache-mib
+threshold (same default; 0 disables explicit cleanup) and cleanup timing/events.
+Attention profiling now splits QK GEMM, softmax, AV GEMM. No new performance
+measurements or compilation were performed, and no speedup is claimed.
+
+Saved evidence: experiments/unimsps_run11/profile.json uses native GEMM and
+65536 pixel batches. Its largest repeated attention shape totals about 9 seconds
+over 2016 calls, but combines QK, softmax and AV. Cold-start outliers are also
+present. Later run14 metadata records 58.2 seconds for view_00, without an
+operation profile. These are historical observations, not measurements of this
+change or proof that softmax is the remaining dominant cost.
+
+## Encoder and MLP follow-up
+
+Default linear projections now pass bias through Burn's native linear operation
+while preserving batch folding. This exposes linear semantics to the backend;
+actual GEMM epilogue fusion depends on backend dispatch, and is not claimed here.
+The MLP uses a direct token-layout 3x3 depthwise kernel, accumulating in FP32,
+adding bias, rounding the convolution result to native precision, and evaluating
+erf GELU before storing. It avoids the two NCHW layout conversions and separate
+activation pass. FP32 GELU intermediates can change FP16 rounding. Unsupported
+backends retain the prior convolution and GELU. This kernel does not use subgroups
+or cooperative matrices and is intended for portable WGPU execution.
+
+LayerNorm reuses exclusively owned contiguous inputs after loading each row into
+registers. The ownership guard prevents mutation of residual/shared inputs.
+Verbose reports now isolate encoder blocks, spatial reduction preparation,
+residual additions, patch layout conversion, foreground gathering and mask setup.
+These synchronized spans perturb fusion and should only guide diagnosis.
+
+Use --reference-encoder for the prior projection/depthwise implementation; it
+retains the current LayerNorm implementation. --burn-softmax independently
+selects the prior softmax. tools/compare_performance.ps1 runs all four combinations
+in alternating order and exports per-view timings when manually invoked.
+It does not compare numerical outputs. No commands, builds or benchmarks were
+executed during this source-only implementation. Performance is unverified.
+
+## Convolution regression follow-up
+
+Spatial reduction convolutions (kernel=stride, no padding) and stride-2 3x3 patch
+embeddings now use explicit bounded patch packing plus native biased linear GEMM.
+Packing reads [B,H*W,C] with actual strides and emits channel-inner patches.
+OIHW weights are reordered once on the CPU before upload, not each inference.
+The output remains [B,OH*OW,O], directly consumed by LayerNorm. The small first
+embedding, depthwise MLP, decoder and output convolutions retain their paths.
+
+Each patch workspace is limited to 16 MiB using power-of-two row chunks. This
+is not a total VRAM limit: outputs, weights and queued work also consume memory.
+Original convolution weights remain available for fallback, with additional
+packed copies for targeted layers when the GEMM option is enabled.
+
+Use --burn-convolutions to select the prior Burn convolution dispatch and skip
+packed-weight upload. The switch is independent of --reference-encoder and
+--burn-softmax. Unsupported backends retain Burn convolution automatically.
+Verbose profiles separate conv-pack, conv-matmul and the encompassing conv-gemm
+span, with route counts and gemm_convolutions recorded in metadata.
+
+No compilation, numerical comparisons or timing runs were executed. GEMM and
+convolution may use different floating-point accumulation/reduction orders.
+Performance remains to be established by non-verbose runs with and without
+--burn-convolutions; use verbose separately to identify packing/GEMM costs.

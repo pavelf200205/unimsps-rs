@@ -175,3 +175,52 @@ this source repository in the current directory layout.
 Original authors: Clément Hardy, Yvain Quéau, David Tschumperlé (GREYC).
 The translated implementation retains upstream's CeCILL 2.1 license in `LICENSE`.
 No separate weight license was included with the supplied checkpoint/repository.
+
+## Native GEMM follow-up: row softmax and allocator diagnostics
+
+The default GEMM attention path now uses a dedicated row-softmax kernel between
+its two native matrix multiplications. Supported WGPU devices use subgroup
+max/sum with FP32 intermediates and a single output rounding. The score buffer
+is reused only when exclusively owned and contiguous. This retains the existing
+GEMM chunk budget, asynchronous submission, packed projections, custom LayerNorm
+and light-attention kernels. No CUDA or cooperative matrices are required.
+
+Use `--burn-softmax` to retain the previous general Burn softmax. Devices without
+the required subgroup capabilities, wider rows or excessive per-thread register
+requirements automatically retain that implementation. Latest source changes
+have not been compiled or timed here. FP32 reductions may change FP16 rounding.
+
+`--pool-cache-mib N` controls the allocator reservation threshold that triggers
+cleanup. The existing 1536 MiB default is unchanged. Larger values can retain
+more reusable buffers at the cost of higher reserved VRAM; 0 disables these
+explicit cleanup calls. This is a cleanup trigger, not a hard VRAM limit.
+
+Verbose profiling now separates QK GEMM, softmax and AV GEMM, records softmax
+in-place reuse, and measures allocator check/cleanup time. The saved native-GEMM profile in experiments/unimsps_run11 combines both GEMMs
+and softmax and includes cold-start overhead. Later runs have metadata only.
+These records cannot isolate softmax or allocator costs in the 50–55-second build.
+
+### Encoder performance controls
+
+The default encoder uses native biased linear operations and direct token-layout
+depthwise convolution fused with bias and erf GELU. Use --reference-encoder to
+select the previous projection and depthwise path, and --burn-softmax to select
+the previous softmax independently. LayerNorm also conditionally reuses owned
+contiguous buffers. All changes are portable WGPU operations; no CUDA is required.
+These source changes have not been compiled or timed here.
+
+For a manually initiated comparison, tools/compare_performance.ps1 accepts
+-Exe, -Model, -Data (a batch input directory), -Out (a new results directory),
+-Images (default 6), and -Repeats (default 3). It runs four configurations in
+alternating order without verbose profiling and writes timings.csv. Each run
+includes normal warmup; use per-view medians and inspect first-view timings
+separately. The comparison is substantial work and runs only when you launch it.
+
+### Convolution dispatch
+
+Spatial reductions and stride-2 patch embeddings default to bounded patch
+packing plus native GEMM, producing token-layout outputs directly. Packed
+weights are prepared once during load. --burn-convolutions restores Burn's
+convolution dispatch for these layers and skips the extra packed weights.
+Use normal runs to compare throughput and --verbose separately to inspect
+conv-pack and conv-matmul costs. This source change has not been built or timed.

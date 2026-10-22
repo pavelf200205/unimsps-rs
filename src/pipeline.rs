@@ -425,8 +425,8 @@ fn stage_device(
     let images = if let Some(normal) = normal {
         Tensor::cat(vec![images, normal.cast(model.options.dtype).repeat_dim(0, lights)], 1)
     } else { images };
-    Ok(crate::model::normalize(model.forward_masked(images, refinement, host_mask)?
-        .mask_fill(keep_mask.bool_not(), 0.)))
+    let raw = model.forward_masked(images, refinement, host_mask)?;
+    Ok(raw.cast(model.options.dtype).mask_fill(keep_mask.bool_not(), 0.))
 }
 
 /// Four global stages followed by 256px patches/128px stride.
@@ -491,7 +491,7 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
         for y in 0..256 { for x in 0..256 {
             values.push(half::f16::from_f64(g[y] * g[x] / denominator).to_f32());
         }}
-        gaussian = Some(tensor(values, [1, 1, 256, 256], &model.device));
+        gaussian = Some(tensor(values, [1, 1, 256, 256], &model.device).cast(model.options.dtype));
     }
 
     drop(prepare_profile);
@@ -559,7 +559,7 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     drop(prepare_patch_profile);
                     let prediction = stage_device(model, images, Some(n), patch_mask, Some(&patch_host_mask))?;
                     let blend_profile = crate::profile::span(&model.device, || format!("patch/blend size={size}"));
-                    let weighted = (prediction * gaussian.as_ref().unwrap().clone()).cast(model.options.dtype);
+                    let weighted = prediction.cast(model.options.dtype) * gaussian.as_ref().unwrap().clone();
                     let region = [0..1, 0..3, y..y + 256, x..x + 256];
                     let updated = out.clone().slice(region.clone()) + weighted;
                     out = out.slice_assign(region, updated);
