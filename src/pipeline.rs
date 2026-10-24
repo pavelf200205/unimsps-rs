@@ -535,6 +535,7 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
             let total = ((size - 256) / 128 + 1).pow(2);
             let mut count = 0;
             let mut patch_host_mask = vec![false; 256 * 256];
+            let is_final_scale = i + 1 == stages;
             let lights = input.images.len();
             let full_device_images = match &active {
                 ImageLevel::Device(images) => Some(Tensor::cat(
@@ -554,8 +555,29 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                         fg_count += src_row.iter().filter(|&&m| m).count();
                     }
                     if fg_count == 0 {
-                        eprintln!("  Patch {count}/{total} skipped (empty mask)");
-                        continue;
+                        let can_skip = if is_final_scale {
+                            true
+                        } else {
+                            // At intermediate patch scales (e.g. 512x512 before 1024x1024), a non-empty
+                            // 256x256 patch at the next scale can read `prior` up to 128px outside the
+                            // foreground at the current scale. Skip only if that 128px halo is also empty.
+                            let y0 = y.saturating_sub(128);
+                            let y1 = (y + 384).min(size);
+                            let x0 = x.saturating_sub(128);
+                            let x1 = (x + 384).min(size);
+                            let mut any_near = false;
+                            for hy in y0..y1 {
+                                if host_mask[hy * size + x0..hy * size + x1].iter().any(|&m| m) {
+                                    any_near = true;
+                                    break;
+                                }
+                            }
+                            !any_near
+                        };
+                        if can_skip {
+                            eprintln!("  Patch {count}/{total} skipped (empty mask)");
+                            continue;
+                        }
                     }
                     let _patch_profile = crate::profile::phase(&model.device, || format!("patch/size={size} y={y} x={x} foreground={fg_count}"));
                     let prepare_patch_profile = crate::profile::span(&model.device, || format!("patch/prepare size={size}"));
@@ -578,7 +600,10 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     let patch_mask = mask.clone().slice([0..1, 0..1, y..y + 256, x..x + 256])
                         .bool_or(interiors[row * 3 + col].clone());
                     drop(prepare_patch_profile);
-                    let host_mask_slice = if fg_count * 10 < 256 * 256 * 9 {
+                    // At the final scale, only `patch_host_mask` pixels survive `final_mask`, so
+                    // `pool_block` only needs the U-Net decoder dependency cone of `patch_host_mask`.
+                    // At intermediate patch scales, the 192x192 interior is kept for the next scale's prior.
+                    let host_mask_slice = if is_final_scale && fg_count * 10 < 256 * 256 * 9 {
                         Some(patch_host_mask.as_slice())
                     } else {
                         None
@@ -598,9 +623,6 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                 }
             }
             crate::execution::finish(&model.device);
-            if i + 1 < stages {
-                out = out.mask_fill(mask.clone().bool_not(), 0.);
-            }
             out
         });
         if i + 1 == stages { final_mask = Some(mask); }

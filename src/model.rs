@@ -21,39 +21,6 @@ struct ActiveMask {
     padded_len: usize,
 }
 
-/// 2D separable Chebyshev box dilation of a boolean mask by `radius` pixels.
-fn dilate_mask_2d(mask: &[bool], h: usize, w: usize, radius: usize) -> Vec<bool> {
-    if radius == 0 {
-        return mask.to_vec();
-    }
-    let mut horiz = vec![false; h * w];
-    for y in 0..h {
-        let row = &mask[y * w..(y + 1) * w];
-        let dst = &mut horiz[y * w..(y + 1) * w];
-        for x in 0..w {
-            let x0 = x.saturating_sub(radius);
-            let x1 = (x + radius + 1).min(w);
-            dst[x] = row[x0..x1].iter().any(|&v| v);
-        }
-    }
-    let mut out = vec![false; h * w];
-    for y in 0..h {
-        let y0 = y.saturating_sub(radius);
-        let y1 = (y + radius + 1).min(h);
-        for x in 0..w {
-            let mut any = false;
-            for yy in y0..y1 {
-                if horiz[yy * w + x] {
-                    any = true;
-                    break;
-                }
-            }
-            out[y * w + x] = any;
-        }
-    }
-    out
-}
-
 fn effective_pixel_batch(requested: usize) -> usize {
     // Map legacy 5000 / 4096 chunk defaults to 65536 so full patches fit in a single batch.
     if requested == 5000 || requested == 4096 {
@@ -624,15 +591,12 @@ impl Model {
         ));
         let out_n = if pool { 1 } else { n };
         if let Some(mask) = active_mask {
-            let processed = self.set_layer(x_gathered, p, pool);
-            let fg = processed.clone().slice([0..mask.valid_len, 0..out_n, 0..c]);
-            // Slot `mask.valid_len` holds an evaluated representative deep-background token.
-            // Broadcasting its output instead of zeros preserves exact features for subsequent
-            // global spatial self-attention blocks and U-Net decoder skip connections.
-            let bg = processed.slice([mask.valid_len..mask.valid_len + 1, 0..out_n, 0..c]);
-            let base = bg.clone().repeat_dim(0, total_pixels);
-            let delta = fg - bg.repeat_dim(0, mask.valid_len);
-            base.select_assign(0, mask.scatter_idx.clone(), delta, burn::tensor::IndexingUpdateOp::Add)
+            let mut processed = self.set_layer(x_gathered, p, pool);
+            if mask.padded_len > mask.valid_len {
+                processed = processed.slice([0..mask.valid_len, 0..out_n, 0..c]);
+            }
+            let zeros = Tensor::zeros([total_pixels, out_n, c], self.tensor_options());
+            zeros.select_assign(0, mask.scatter_idx.clone(), processed, burn::tensor::IndexingUpdateOp::Add)
         } else {
             self.set_layer(x_gathered, p, pool)
         }
@@ -712,69 +676,71 @@ impl Model {
             let mask_profile = crate::profile::span(&self.device, || format!("mask/prepare-stage {}", i + 1));
             if i == 0 {
                 if let Some(prev) = current_mask.take() {
-                    // Dilate by Chebyshev radius 6 at Stage 0: 2px for 2x bilinear prior normal
-                    // upsampling + 1px for patch_embed1 (3x3) + 3px for three block1 3x3 dwconvs.
-                    current_mask = Some(dilate_mask_2d(&prev, oh, ow, 6));
-                }
-            } else if i == 1 {
-                if let Some(prev) = current_mask.take() {
-                    // Downsample by 2x (3x3 stride 2 pad 1 max-pool to match patch_embed2)
-                    // then dilate by radius 4 for the four block2 3x3 dwconvs.
-                    let mut downsampled = vec![false; oh * ow];
+                    // Exact backward dependency cone for `pools[0]` through `output_block` (3x3 conv, pad 1):
+                    // output at K0 only reads `pools[0]` within Chebyshev distance 1 of K0.
+                    let mut d0 = vec![false; oh * ow];
                     for y in 0..oh {
+                        let y0 = y.saturating_sub(1);
+                        let y1 = (y + 1).min(oh - 1);
                         for x in 0..ow {
-                            let sy = 2 * y;
-                            let sx = 2 * x;
+                            let x0 = x.saturating_sub(1);
+                            let x1 = (x + 1).min(ow - 1);
                             let mut any = false;
-                            for dy in sy.saturating_sub(1)..=(sy + 1).min(ih - 1) {
-                                for dx in sx.saturating_sub(1)..=(sx + 1).min(iw - 1) {
-                                    if prev[dy * iw + dx] {
+                            for yy in y0..=y1 {
+                                for xx in x0..=x1 {
+                                    if prev[yy * ow + xx] {
                                         any = true;
                                         break;
                                     }
                                 }
                                 if any { break; }
                             }
-                            downsampled[y * ow + x] = any;
+                            d0[y * ow + x] = any;
                         }
                     }
-                    current_mask = Some(dilate_mask_2d(&downsampled, oh, ow, 4));
+                    current_mask = Some(d0);
                 }
-            } else {
-                // Stages 2 (64x64 = 4096) and 3 (32x32 = 1024) are already single-bucket sizes
-                // where cumulative convolutional & border halos cover most of the grid.
-                current_mask = None;
+            } else if let Some(prev) = current_mask.take() {
+                // Exact backward dependency cone for `pools[i]` through `up_block` (ConvTranspose2d 4x4, stride 2, pad 1):
+                // output pixel y at 2x resolution depends on input u where y in [2*u - 1, 2*u + 2].
+                let mut next_mask = vec![false; oh * ow];
+                for u in 0..oh {
+                    let y0 = (2 * u).saturating_sub(1);
+                    let y1 = (2 * u + 2).min(ih - 1);
+                    for v in 0..ow {
+                        let x0 = (2 * v).saturating_sub(1);
+                        let x1 = (2 * v + 2).min(iw - 1);
+                        let mut any = false;
+                        for yy in y0..=y1 {
+                            for xx in x0..=x1 {
+                                if prev[yy * iw + xx] {
+                                    any = true;
+                                    break;
+                                }
+                            }
+                            if any { break; }
+                        }
+                        next_mask[u * ow + v] = any;
+                    }
+                }
+                current_mask = Some(next_mask);
             }
-            let border = if i == 0 { 4 } else { 7 };
             let active_mask = current_mask.as_ref().and_then(|m| {
-                if i >= 2 || oh <= 64 || ow <= 64 || oh <= 2 * border || ow <= 2 * border {
-                    return None;
-                }
-                let mut indices = Vec::with_capacity(m.len());
-                let mut bg_pixel: Option<i32> = None;
-                for y in 0..oh {
-                    let on_y_border = y < border || y + border >= oh;
-                    for x in 0..ow {
-                        let idx = y * ow + x;
-                        let on_border = on_y_border || x < border || x + border >= ow;
-                        if m[idx] || on_border {
-                            indices.push(idx as i32);
-                        } else if bg_pixel.is_none() {
-                            bg_pixel = Some(idx as i32);
-                        }
-                    }
-                }
-                let bg_pixel = bg_pixel?;
-                let valid_len = indices.len();
-                let gather_len = valid_len + 1;
+                let keep_count = m.iter().filter(|&&k| k).count();
                 // Only use gather/scatter when it saves at least 10% of pixels and is non-empty
-                if valid_len == 0 || gather_len * 10 >= m.len() * 9 {
+                if keep_count == 0 || keep_count * 10 >= m.len() * 9 {
                     return None;
                 }
-                let full_chunks = (gather_len / batch_limit) * batch_limit;
-                let rem = gather_len - full_chunks;
+                let indices: Vec<i32> = m
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, &keep)| if keep { Some(idx as i32) } else { None })
+                    .collect();
+                let valid_len = indices.len();
+                let full_chunks = (valid_len / batch_limit) * batch_limit;
+                let rem = valid_len - full_chunks;
                 let padded_len = if rem == 0 {
-                    gather_len
+                    valid_len
                 } else {
                     full_chunks + static_bucket_size(rem, batch_limit)
                 };
@@ -782,14 +748,16 @@ impl Model {
                     TensorData::new(indices.clone(), [valid_len]),
                     &self.device,
                 );
-                // Slot `valid_len` (and any static bucket padding) evaluates the representative
-                // deep-background pixel `bg_pixel` so all ungathered tokens get its exact output.
-                let mut padded = indices;
-                padded.resize(padded_len, bg_pixel);
-                let gather_idx = Tensor::<1, burn::tensor::Int>::from_data(
-                    TensorData::new(padded, [padded_len]),
-                    &self.device,
-                );
+                let gather_idx = if padded_len > valid_len {
+                    let mut padded = indices;
+                    padded.resize(padded_len, 0);
+                    Tensor::<1, burn::tensor::Int>::from_data(
+                        TensorData::new(padded, [padded_len]),
+                        &self.device,
+                    )
+                } else {
+                    scatter_idx.clone()
+                };
                 Some(ActiveMask {
                     gather_idx,
                     scatter_idx,
@@ -838,20 +806,23 @@ impl Model {
             };
             let gather_profile = crate::profile::span(&self.device, || format!("layout/foreground-gather stage={}", i + 1));
             let x = encoded.permute([1, 0, 2]);
-            // Gather foreground tokens ONCE per stage and share between pool_block and light_block.
-            let x_gathered = if let Some(ref mask) = active_mask {
-                x.select(0, mask.gather_idx.clone())
+            // `pool_block` outputs only enter the local convolutional U-Net decoder, so gathering
+            // the exact decoder backward cone `active_mask` is 100% lossless (0.0 error on kept pixels).
+            let x_pool = if let Some(ref mask) = active_mask {
+                x.clone().select(0, mask.gather_idx.clone())
             } else {
-                x
+                x.clone()
             };
             drop(gather_profile);
             let pool = self
-                .set_layer_pre_gathered(x_gathered.clone(), &format!("{root}.pool_block{}", i + 1), true, active_mask.as_ref(), oh * ow)
+                .set_layer_pre_gathered(x_pool, &format!("{root}.pool_block{}", i + 1), true, active_mask.as_ref(), oh * ow)
                 .reshape([1, oh, ow, c])
                 .permute([0, 3, 1, 2]);
             if i < 3 {
+                // `light_block` feeds into subsequent encoder stages (`block2`, `block3`, `block4`)
+                // which perform global spatial self-attention over all spatial tokens in the patch.
                 images = self
-                    .set_layer_pre_gathered(x_gathered, &format!("{root}.light_block{}", i + 1), false, active_mask.as_ref(), oh * ow)
+                    .set_layer(x, &format!("{root}.light_block{}", i + 1), false)
                     .permute([1, 2, 0])
                     .reshape([lights, c, oh, ow]);
                 pools.push(pool);
