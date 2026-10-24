@@ -193,44 +193,48 @@ impl Input {
                 padded_mask[(y + py) * size + x + px] = mask[(y + ymin) * w + x + xmin];
             }
         }
-        let mut images = Vec::new();
-        for file in &files {
-            let img = image::open(file)
-                .with_context(|| format!("Decode {}", file.display()))?
-                .to_rgb32f();
-            ensure!(
-                img.width() as usize == w && img.height() as usize == h,
-                "Image dimensions differ: {}",
-                file.display()
-            );
-            let mut r = Raster::zeros(3, size, size);
-            let mut sum = 0f64;
-            let mut count = 0;
-            for y in 0..ch {
-                for x in 0..cw {
-                    let p = img.get_pixel((x + xmin) as u32, (y + ymin) as u32);
-                    let idx = (y + py) * size + x + px;
-                    for c in 0..3 {
-                        let v = p[2 - c];
-                        r.data[c * size * size + idx] = v;
-                        if padded_mask[idx] {
-                            sum += v as f64;
-                            count += 1;
+        use rayon::prelude::*;
+        let images = files
+            .par_iter()
+            .map(|file| -> Result<Raster> {
+                let img = image::open(file)
+                    .with_context(|| format!("Decode {}", file.display()))?
+                    .to_rgb32f();
+                ensure!(
+                    img.width() as usize == w && img.height() as usize == h,
+                    "Image dimensions differ: {}",
+                    file.display()
+                );
+                let mut r = Raster::zeros(3, size, size);
+                let mut sum = 0f64;
+                let mut count = 0usize;
+                for y in 0..ch {
+                    for x in 0..cw {
+                        let p = img.get_pixel((x + xmin) as u32, (y + ymin) as u32);
+                        let idx = (y + py) * size + x + px;
+                        let is_fg = padded_mask[idx];
+                        for c in 0..3 {
+                            let v = p[2 - c];
+                            r.data[c * size * size + idx] = v;
+                            if is_fg {
+                                sum += v as f64;
+                                count += 1;
+                            }
                         }
                     }
                 }
-            }
-            ensure!(
-                sum.is_finite() && sum > 0. && count > 0,
-                "Image has zero/invalid masked intensity: {}",
-                file.display()
-            );
-            let mean = (sum / count as f64) as f32;
-            for v in &mut r.data {
-                *v /= mean;
-            }
-            images.push(r);
-        }
+                ensure!(
+                    sum.is_finite() && sum > 0. && count > 0,
+                    "Image has zero/invalid masked intensity: {}",
+                    file.display()
+                );
+                let inv_mean = (count as f64 / sum) as f32;
+                for v in &mut r.data {
+                    *v *= inv_mean;
+                }
+                Ok(r)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             images,
             mask: padded_mask,
@@ -630,9 +634,86 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
     let _readback_profile = crate::profile::phase(&model.device, || "output/normalize-mask-and-readback".into());
     let normal = crate::model::normalize(normal.context("Empty image pyramid")?)
         .mask_fill(final_mask.context("Missing final mask")?.bool_not(), 0.);
-    Ok(Raster { c: 3, h: input.size, w: input.size, data: read_tensor(normal) })
+    let data = read_tensor(normal);
+    crate::execution::cleanup_view(&model.device);
+    Ok(Raster { c: 3, h: input.size, w: input.size, data })
 }
+#[derive(Clone, Copy, Debug)]
+pub struct SaveFormats {
+    pub exr: bool,
+    pub png: bool,
+    pub mat: bool,
+    pub f32: bool,
+}
+
+impl Default for SaveFormats {
+    fn default() -> Self {
+        Self {
+            exr: true,
+            png: true,
+            mat: false,
+            f32: false,
+        }
+    }
+}
+
+impl SaveFormats {
+    pub fn parse(specs: &[String]) -> Result<Self> {
+        let mut out = Self {
+            exr: false,
+            png: false,
+            mat: false,
+            f32: false,
+        };
+        for item in specs {
+            for token in item.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match token.to_ascii_lowercase().as_str() {
+                    "exr" | ".exr" => out.exr = true,
+                    "png" | ".png" => out.png = true,
+                    "mat" | ".mat" => out.mat = true,
+                    "f32" | ".f32" | "raw" => out.f32 = true,
+                    "all" => {
+                        out.exr = true;
+                        out.png = true;
+                        out.mat = true;
+                        out.f32 = true;
+                    }
+                    other => anyhow::bail!(
+                        "Unknown normal format '{other}' (supported: exr, png, mat, f32, all)"
+                    ),
+                }
+            }
+        }
+        ensure!(
+            out.exr || out.png || out.mat || out.f32,
+            "At least one output format must be specified"
+        );
+        Ok(out)
+    }
+
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.exr {
+            v.push("exr");
+        }
+        if self.png {
+            v.push("png");
+        }
+        if self.mat {
+            v.push("mat");
+        }
+        if self.f32 {
+            v.push("f32");
+        }
+        v
+    }
+}
+
 pub fn save(normal: &Raster, out: &Path) -> Result<()> {
+    save_with_formats(normal, out, SaveFormats::default())
+}
+
+pub fn save_with_formats(normal: &Raster, out: &Path, formats: SaveFormats) -> Result<()> {
     std::fs::create_dir_all(out)?;
     let (h, w) = (normal.h, normal.w);
     let n = h * w;
@@ -640,26 +721,52 @@ pub fn save(normal: &Raster, out: &Path) -> Result<()> {
         normal.data.iter().all(|v| v.is_finite()),
         "Non-finite output normals"
     );
-    let mut rgb = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(w as u32, h as u32);
-    let mut exr = ImageBuffer::<Rgb<f32>, Vec<f32>>::new(w as u32, h as u32);
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            let p = [normal.data[i], normal.data[n + i], normal.data[2 * n + i]];
-            exr.put_pixel(x as u32, y as u32, Rgb(p));
-            rgb.put_pixel(
-                x as u32,
-                y as u32,
-                Rgb(p.map(|v| ((v + 1.) * 127.5).clamp(0., 255.) as u8)),
-            );
-        }
+    let (res_exr, res_png) = rayon::join(
+        || -> Result<()> {
+            if !formats.exr {
+                return Ok(());
+            }
+            let mut exr = ImageBuffer::<Rgb<f32>, Vec<f32>>::new(w as u32, h as u32);
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    let p = [normal.data[i], normal.data[n + i], normal.data[2 * n + i]];
+                    exr.put_pixel(x as u32, y as u32, Rgb(p));
+                }
+            }
+            exr.save(out.join("normal.exr"))?;
+            Ok(())
+        },
+        || -> Result<()> {
+            if !formats.png {
+                return Ok(());
+            }
+            let mut rgb = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(w as u32, h as u32);
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    let p = [normal.data[i], normal.data[n + i], normal.data[2 * n + i]];
+                    rgb.put_pixel(
+                        x as u32,
+                        y as u32,
+                        Rgb(p.map(|v| ((v + 1.) * 127.5).clamp(0., 255.) as u8)),
+                    );
+                }
+            }
+            rgb.save(out.join("normal.png"))?;
+            Ok(())
+        },
+    );
+    res_exr?;
+    res_png?;
+    if formats.mat {
+        save_mat(normal, &out.join("normal.mat"))?;
     }
-    rgb.save(out.join("normal.png"))?;
-    exr.save(out.join("normal.exr"))?;
-    save_mat(normal, &out.join("normal.mat"))?;
-    // Portable raw output is CHW float32; dimensions/convention are in metadata.json.
-    let bytes: Vec<u8> = normal.data.iter().flat_map(|v| v.to_le_bytes()).collect();
-    std::fs::write(out.join("normal.f32"), bytes)?;
+    if formats.f32 {
+        // Portable raw output is CHW float32; dimensions/convention are in metadata.json.
+        let bytes: Vec<u8> = normal.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(out.join("normal.f32"), bytes)?;
+    }
     Ok(())
 }
 

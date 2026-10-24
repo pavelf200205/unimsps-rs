@@ -35,12 +35,18 @@ fn effective_pixel_batch(requested: usize) -> usize {
 /// multiples of 256 (`256..5000`), eliminating ~80% of dynamic shape compilations and autotuning.
 #[inline]
 fn static_bucket_size(valid_pixels: usize, max_batch: usize) -> usize {
-    if valid_pixels == max_batch || max_batch < 256 {
-        return valid_pixels;
+    if valid_pixels >= max_batch || max_batch <= 4096 {
+        return valid_pixels.max(max_batch.min(4096));
     }
-    let floor = if valid_pixels <= 256 { 256 } else { 1024.min(max_batch) };
+    // Restrict set-transformer buckets to {4096, 16384, 32768, 65536} (matching the encoder stage
+    // token counts 64x64=4096, 128x128=16384, 256x256=65536 plus 32768) so Burn's Fusion JIT and
+    // GEMM autotuner reuse already-compiled stage shapes instead of compiling new kernels mid-run.
+    for &b in &[4096usize, 16384, 32768, 65536] {
+        if valid_pixels <= b && b <= max_batch {
+            return b;
+        }
+    }
     valid_pixels
-        .max(floor)
         .checked_next_power_of_two()
         .unwrap_or(max_batch)
         .min(max_batch)
@@ -68,7 +74,7 @@ impl Default for ModelOptions {
             pixel_batch: 65536,
             query_batch: 0,
             fused_attention: false,
-            score_budget_mib: 512,
+            score_budget_mib: 256,
             fused_softmax: true,
             optimized_encoder: true,
             gemm_convolutions: true,
@@ -89,6 +95,9 @@ pub fn read_tensor<const D: usize>(x: Tensor<D>) -> Vec<f32> {
     x.cast(FloatDType::F32).into_data().try_to_vec::<f32>().expect("FP32 tensor")
 }
 pub fn normalize(x: Tensor<4>) -> Tensor<4> {
+    if let Some(out) = crate::norm::normalize_3ch(x.clone()) {
+        return out;
+    }
     // Normal-vector reductions must not underflow when activations use FP16.
     let x = x.cast(FloatDType::F32);
     let norm = x.clone().square().sum_dim(1).sqrt().clamp_min(1e-12);
@@ -220,6 +229,26 @@ impl Model {
             let (_, v_b) = raw_f32.remove(&format!("{prefix}.fc_v.bias")).unwrap();
             k_b.extend_from_slice(&v_b);
             raw_f32.insert(format!("{prefix}.fc_kv.bias"), (vec![2 * output], k_b));
+        }
+
+        // Pack Stage 3 (sr_ratio == 1) spatial `attn.q` [512, 512] and `attn.kv` [512, 1024]
+        // into a single `attn.qkv` [512, 1536] GEMM since both project the same `norm1(x)` input.
+        let sr1_prefixes: Vec<String> = raw_f32
+            .keys()
+            .filter_map(|name| name.strip_suffix(".attn.q.weight").map(str::to_owned))
+            .filter(|prefix| !raw_f32.contains_key(&format!("{prefix}.attn.sr.weight")))
+            .collect();
+        for prefix in sr1_prefixes {
+            let (q_shape, q_w) = &raw_f32[&format!("{prefix}.attn.q.weight")];
+            let (_, kv_w) = &raw_f32[&format!("{prefix}.attn.kv.weight")];
+            let c = q_shape[0];
+            let mut qkv_w = vec![0f32; c * 3 * c];
+            for r in 0..c {
+                qkv_w[r * 3 * c..r * 3 * c + c].copy_from_slice(&q_w[r * c..(r + 1) * c]);
+                qkv_w[r * 3 * c + c..(r + 1) * 3 * c]
+                    .copy_from_slice(&kv_w[r * 2 * c..(r + 1) * 2 * c]);
+            }
+            raw_f32.insert(format!("{prefix}.attn.qkv.weight"), (vec![c, 3 * c], qkv_w));
         }
 
         // Prepack targeted dense convolutions with channel-inner patch reduction order.
@@ -374,11 +403,7 @@ impl Model {
         let m = kv.dims()[1];
         let d = c / heads;
         let _profile = crate::profile::span(&self.device, || format!("attention/{} B={b} Q={n} K={m} C={c} heads={heads}", if spatial { "spatial" } else { "light" }));
-        if !spatial {
-            if let Some(out) = crate::light_attention::forward(q.clone(), kv.clone(), heads) {
-                return out;
-            }
-        } else if self.options.fused_attention {
+        if spatial && self.options.fused_attention {
             let q_probe = q.clone().reshape([b, n, heads, d]);
             let use_cmma_flash = n >= 4096 && m >= 64 && crate::attention::supported(&q_probe, &q_probe);
             if !use_cmma_flash && crate::attention::subgroup_supported(&q) {
@@ -474,15 +499,19 @@ impl Model {
         let [b, n, c] = x.dims();
         let _block_profile = crate::profile::span(&self.device, || format!("encoder-block/{p} B={b} N={n} C={c}"));
         let z = self.norm(x.clone(), &format!("{p}.norm1"));
-        let q = self.linear(z.clone(), &format!("{p}.attn.q"));
-        let z = if sr > 1 {
+        let (q, kv) = if sr > 1 {
+            let q = self.linear(z.clone(), &format!("{p}.attn.q"));
             let _reduction_profile = crate::profile::span(&self.device, || format!("encoder/spatial-reduction {p} stride={sr}"));
             let a = self.conv_tokens(z, &format!("{p}.attn.sr"), h, w, sr, sr, 0);
-            self.norm(a, &format!("{p}.attn.norm"))
+            let z_sr = self.norm(a, &format!("{p}.attn.norm"));
+            let kv = self.linear(z_sr, &format!("{p}.attn.kv"));
+            (q, kv)
         } else {
-            z
+            let qkv = self.linear(z, &format!("{p}.attn.qkv"));
+            let q = qkv.clone().slice([0..b, 0..n, 0..c]);
+            let kv = qkv.slice([0..b, 0..n, c..3 * c]);
+            (q, kv)
         };
-        let kv = self.linear(z, &format!("{p}.attn.kv"));
         let a = self.attention_packed(q, kv, heads, 1.0 / (c as f32 / heads as f32).sqrt(), true);
         let projected = self.linear(a, &format!("{p}.attn.proj"));
         let residual_profile = crate::profile::span(&self.device, || format!("encoder/attention-residual {p}"));
@@ -522,7 +551,12 @@ impl Model {
         let c = q.dims()[2];
         let kv = self.linear(y, &format!("{p}.fc_kv"));
         // Set transformer uses sqrt(full dimension), unlike spatial attention.
-        let o = q.clone() + self.attention_packed(q, kv, 4, 1.0 / (c as f32).sqrt(), false);
+        // `light_attention::forward` fuses the `q + attn` residual directly in registers.
+        let o = if let Some(out) = crate::light_attention::forward(q.clone(), kv.clone(), 4) {
+            out
+        } else {
+            q.clone() + self.attention_packed(q, kv, 4, 1.0 / (c as f32).sqrt(), false)
+        };
         let z = if self.weights.contains_key(&format!("{p}.ln1.weight")) {
             self.norm(o.clone(), &format!("{p}.ln1"))
         } else {
@@ -591,12 +625,15 @@ impl Model {
         ));
         let out_n = if pool { 1 } else { n };
         if let Some(mask) = active_mask {
-            let mut processed = self.set_layer(x_gathered, p, pool);
-            if mask.padded_len > mask.valid_len {
-                processed = processed.slice([0..mask.valid_len, 0..out_n, 0..c]);
-            }
-            let zeros = Tensor::zeros([total_pixels, out_n, c], self.tensor_options());
-            zeros.select_assign(0, mask.scatter_idx.clone(), processed, burn::tensor::IndexingUpdateOp::Add)
+            let processed = self.set_layer(x_gathered, p, pool);
+            // Scatter the full bucket-sized `processed` [padded_len, out_n, c] without slicing to the
+            // unbucketed `valid_len`: padding indices in `scatter_idx` point to the extra trash slot
+            // at index `total_pixels`, which is sliced off afterwards. This guarantees zero per-patch
+            // Fusion kernel recompilations and 100% buffer reuse in the memory pool across viewpoints.
+            let zeros = Tensor::zeros([total_pixels + 1, out_n, c], self.tensor_options());
+            zeros
+                .select_assign(0, mask.scatter_idx.clone(), processed, burn::tensor::IndexingUpdateOp::Add)
+                .slice([0..total_pixels, 0..out_n, 0..c])
         } else {
             self.set_layer(x_gathered, p, pool)
         }
@@ -726,17 +763,15 @@ impl Model {
                 current_mask = Some(next_mask);
             }
             let active_mask = current_mask.as_ref().and_then(|m| {
+                // Stages 2 (64x64 = 4096) and 3 (32x32 = 1024) are already <= the minimum 4096 bucket.
+                if i >= 2 || m.len() <= 4096 {
+                    return None;
+                }
                 let keep_count = m.iter().filter(|&&k| k).count();
-                // Only use gather/scatter when it saves at least 10% of pixels and is non-empty
                 if keep_count == 0 || keep_count * 10 >= m.len() * 9 {
                     return None;
                 }
-                let indices: Vec<i32> = m
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, &keep)| if keep { Some(idx as i32) } else { None })
-                    .collect();
-                let valid_len = indices.len();
+                let valid_len = keep_count;
                 let full_chunks = (valid_len / batch_limit) * batch_limit;
                 let rem = valid_len - full_chunks;
                 let padded_len = if rem == 0 {
@@ -744,20 +779,29 @@ impl Model {
                 } else {
                     full_chunks + static_bucket_size(rem, batch_limit)
                 };
-                let scatter_idx = Tensor::<1, burn::tensor::Int>::from_data(
-                    TensorData::new(indices.clone(), [valid_len]),
+                if padded_len >= m.len() {
+                    return None;
+                }
+                let mut gather_indices: Vec<i32> = Vec::with_capacity(padded_len);
+                for (idx, &keep) in m.iter().enumerate() {
+                    if keep {
+                        gather_indices.push(idx as i32);
+                    }
+                }
+                let mut scatter_indices = gather_indices.clone();
+                if padded_len > valid_len {
+                    gather_indices.resize(padded_len, 0);
+                    // Route padded slots to the trash slot at `m.len()` (`total_pixels`).
+                    scatter_indices.resize(padded_len, m.len() as i32);
+                }
+                let gather_idx = Tensor::<1, burn::tensor::Int>::from_data(
+                    TensorData::new(gather_indices, [padded_len]),
                     &self.device,
                 );
-                let gather_idx = if padded_len > valid_len {
-                    let mut padded = indices;
-                    padded.resize(padded_len, 0);
-                    Tensor::<1, burn::tensor::Int>::from_data(
-                        TensorData::new(padded, [padded_len]),
-                        &self.device,
-                    )
-                } else {
-                    scatter_idx.clone()
-                };
+                let scatter_idx = Tensor::<1, burn::tensor::Int>::from_data(
+                    TensorData::new(scatter_indices, [padded_len]),
+                    &self.device,
+                );
                 Some(ActiveMask {
                     gather_idx,
                     scatter_idx,

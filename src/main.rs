@@ -3,8 +3,9 @@ use burn::tensor::{Device, DeviceKind, FloatDType};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use unimsps::{
+    cache::{default_cache_dir, init_environment},
     model::{Model, ModelOptions, read_tensor, tensor},
-    pipeline::{Input, ProcessOptions, process_with_options, save},
+    pipeline::{Input, ProcessOptions, SaveFormats, process_with_options, save_with_formats},
 };
 
 #[derive(Parser)]
@@ -14,31 +15,34 @@ struct Cli {
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
     /// Maximum chunks queued between synchronous GPU waits; 0 uses asynchronous submission.
-    #[arg(long, default_value_t = 0, global = true)]
+    #[arg(long, default_value_t = 1, global = true)]
     queue_depth: usize,
-    #[arg(long)]
+    #[arg(long, global = true)]
     cpu: bool,
-    #[arg(long, conflicts_with = "cpu")]
+    #[arg(long, conflicts_with = "cpu", global = true)]
     integrated: bool,
-    /// Auto selects WGPU on every build. CUDA is only used when explicitly requested.
-    #[arg(long,default_value="auto",value_parser=["auto","cuda","vulkan","dx12","metal"])]
+    /// Use the NVIDIA CUDA backend (equivalent to --api cuda).
+    #[arg(long, conflicts_with_all = ["cpu", "integrated"], global = true)]
+    cuda: bool,
+    /// Auto selects WGPU on every build unless --cuda is passed.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "cuda", "vulkan", "dx12", "metal"], global = true)]
     api: String,
     /// Set-transformer pixel batch size (defaults to 65536 to process entire patches in one batch).
-    #[arg(long, default_value_t = 65536)]
+    #[arg(long, default_value_t = 65536, global = true)]
     pixel_batch: usize,
     /// Spatial attention query limit; 0 uses full chunk budget. Unfused scores remain bounded.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, global = true)]
     query_batch: usize,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 8, global = true)]
     encoder_batch: usize,
     /// Auto selects FP16 on supporting GPUs, FP32 on CPU/other adapters.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "fp16", "fp32"])]
+    #[arg(long, default_value = "auto", value_parser = ["auto", "fp16", "fp32"], global = true)]
     precision: String,
     /// RGB input/pyramid cache budget, excluding model weights and normal maps.
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 512, global = true)]
     image_cache_mib: usize,
-    /// Memory budget in MiB for attention score matrix allocation before chunking (default: 512 MiB).
-    #[arg(long, default_value_t = 512)]
+    /// Memory budget in MiB for attention score matrix allocation before chunking (default: 256 MiB).
+    #[arg(long, default_value_t = 256, global = true)]
     score_budget_mib: usize,
     /// Use Burn's general softmax instead of the dedicated GEMM-attention row kernel.
     #[arg(long, global = true)]
@@ -49,21 +53,31 @@ struct Cli {
     /// Retain Burn convolution dispatch for spatial reductions and stride-2 embeddings.
     #[arg(long, global = true)]
     burn_convolutions: bool,
-    /// Allocator reservation threshold for cleanup; 0 retains cached buffers.
-    #[arg(long, default_value_t = 1536, global = true)]
+    /// Allocator reservation threshold for cleanup; 0 retains cached buffers (default: 1024 MiB).
+    #[arg(long, default_value_t = 1024, global = true)]
     pool_cache_mib: usize,
     /// Force custom subgroup fused spatial attention instead of standard hardware GEMM.
-    #[arg(long)]
+    #[arg(long, global = true)]
     fused_attention: bool,
     /// Legacy flag: Use explicit matmul/softmax spatial attention (now the default).
-    #[arg(long)]
+    #[arg(long, global = true)]
     unfused_attention: bool,
     /// Skip pipeline and GPU kernel pre-warm pass before timed inference.
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_warmup: bool,
+    /// Comma-separated normal map formats to save: exr, png, mat, f32, or all (default: exr,png).
+    #[arg(long, visible_aliases = ["format", "save-formats", "save_formats"], value_delimiter = ',', default_value = "exr,png", global = true)]
+    formats: Vec<String>,
+    /// Directory used to persist compiled GPU shaders, CUDA JIT binaries, and warmup state across runs.
+    #[arg(long, visible_aliases = ["cache-dir", "cache_dir"], global = true)]
+    kernel_cache_dir: Option<PathBuf>,
+    /// Disable persistent GPU kernel caching across runs.
+    #[arg(long, global = true)]
+    no_kernel_cache: bool,
     #[command(subcommand)]
     command: Command,
 }
+
 #[derive(Subcommand)]
 enum Command {
     Doctor,
@@ -90,21 +104,43 @@ enum Command {
         tolerance: f32,
     },
 }
+
 fn main() -> Result<()> {
+    let program_start = std::time::Instant::now();
     let cli = Cli::parse();
-    eprintln!("unimsps 0.1.1 (WGPU native GEMM + row-softmax build)");
+    eprintln!("unimsps 0.1.2 (WGPU/CUDA native GEMM + persistent kernel cache build)");
     unimsps::profile::configure(cli.verbose);
     unimsps::execution::configure(cli.queue_depth);
     unimsps::execution::configure_pool_cache(cli.pool_cache_mib);
-    ensure!(!(cli.integrated && cli.api == "cuda"), "--integrated cannot select CUDA");
-    let use_cuda = cli.api == "cuda";
+
+    let cache_dir = cli.kernel_cache_dir.clone().unwrap_or_else(default_cache_dir);
+    let mut kernel_cache = if !cli.no_kernel_cache && !cli.cpu {
+        init_environment(&cache_dir, cli.kernel_cache_dir.is_some())
+    } else {
+        Default::default()
+    };
+
+    let use_cuda = cli.cuda || cli.api == "cuda";
+    ensure!(!(cli.integrated && use_cuda), "--integrated cannot select CUDA");
+    let effective_api = if cli.cpu {
+        "cpu"
+    } else if use_cuda {
+        "cuda"
+    } else {
+        cli.api.as_str()
+    };
+
     let device = if cli.cpu {
         Device::flex()
     } else if use_cuda {
         #[cfg(feature = "cuda")]
-        { Device::cuda(0) }
+        {
+            Device::cuda(0)
+        }
         #[cfg(not(feature = "cuda"))]
-        { anyhow::bail!("CUDA support requires rebuilding with cargo build --release --features cuda"); }
+        {
+            anyhow::bail!("CUDA support requires rebuilding with cargo build --release --features cuda");
+        }
     } else {
         use burn::tensor::wgpu::WgpuBackend;
         Device::wgpu_options()
@@ -117,13 +153,26 @@ fn main() -> Result<()> {
                 "vulkan" => WgpuBackend::Vulkan,
                 "dx12" => WgpuBackend::Dx12,
                 "metal" => WgpuBackend::Metal,
-                _ => WgpuBackend::Auto,
+                _ => {
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    {
+                        WgpuBackend::Vulkan
+                    }
+                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                    {
+                        WgpuBackend::Auto
+                    }
+                }
             })
             .init()
             .map_err(|e| anyhow::anyhow!("GPU initialization: {e:?}"))?
     };
-    eprintln!("Device: {:?}", device.identity());
+    eprintln!("Device: {:?} (api: {effective_api})", device.identity());
     eprintln!("Queue depth: {} (0 = asynchronous flush)", cli.queue_depth);
+    if !cli.no_kernel_cache && !cli.cpu {
+        eprintln!("Kernel cache: {}", cache_dir.display());
+    }
+
     match cli.command {
         Command::Doctor => {
             let x = tensor(vec![1., 2., 3., 4.], [2, 2], &device);
@@ -137,6 +186,7 @@ fn main() -> Result<()> {
             batch,
         } => {
             ensure!(images == -1 || images > 0, "--images must be -1 (all) or a positive count");
+            let save_formats = SaveFormats::parse(&cli.formats)?;
             let image_limit = if images == -1 { None } else { Some(images as usize) };
             let mut objects = if batch {
                 std::fs::read_dir(&data)?
@@ -170,43 +220,64 @@ fn main() -> Result<()> {
             })?;
             drop(load_profile);
             eprintln!(
-                "Precision: {dtype:?}; encoder batch: {}; pixel batch: {}; score budget: {} MiB; attention: {}",
+                "Precision: {dtype:?}; encoder batch: {}; pixel batch: {}; score budget: {} MiB; formats: {}; attention: {}",
                 cli.encoder_batch,
                 net.options.pixel_batch,
                 net.options.score_budget_mib,
+                save_formats.names().join(","),
                 if net.options.fused_attention { "fused subgroup" } else { "hardware GEMM" }
             );
+            let warmup_lights = if let Some(limit) = image_limit {
+                limit.max(1)
+            } else if let Some(first_obj) = objects.first() {
+                let count = std::fs::read_dir(first_obj)
+                    .ok()
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok().map(|e| e.path()))
+                            .filter(|p| {
+                                let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                                let ext = p.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+                                p.is_file()
+                                    && !name.contains("mask")
+                                    && !name.contains("normal")
+                                    && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "tif" | "tiff")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(cli.encoder_batch);
+                count.max(1)
+            } else {
+                cli.encoder_batch
+            };
+            let cache_signature = format!(
+                "{:?}|{}|{:?}|eb={}|pb={}|l={}|fa={}|fs={}|oe={}|gc={}",
+                net.device.identity(),
+                effective_api,
+                dtype,
+                cli.encoder_batch,
+                net.options.pixel_batch,
+                warmup_lights,
+                net.options.fused_attention,
+                net.options.fused_softmax,
+                net.options.optimized_encoder,
+                net.options.gemm_convolutions,
+            );
             if !cli.no_warmup && !cli.cpu {
-                let warmup_lights = if let Some(limit) = image_limit {
-                    limit.max(1)
-                } else if let Some(first_obj) = objects.first() {
-                    let count = std::fs::read_dir(first_obj)
-                        .ok()
-                        .map(|entries| {
-                            entries
-                                .filter_map(|e| e.ok().map(|e| e.path()))
-                                .filter(|p| {
-                                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                                    let ext = p.extension().unwrap_or_default().to_string_lossy().to_lowercase();
-                                    p.is_file()
-                                        && !name.contains("mask")
-                                        && !name.contains("normal")
-                                        && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "tif" | "tiff")
-                                })
-                                .count()
-                        })
-                        .unwrap_or(cli.encoder_batch);
-                    count.max(1)
+                if !cli.no_kernel_cache && kernel_cache.is_warmed(&cache_signature) {
+                    eprintln!("Kernel cache hit for current configuration; skipping pre-warm pass.");
                 } else {
-                    cli.encoder_batch
-                };
-                eprintln!("Pre-warming GPU kernels (spatial attention, GEMMs, norms, decoders for {warmup_lights} lights)...");
-                let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/pipeline".into());
-                net.warmup(warmup_lights)?;
-                drop(warmup_profile);
-                eprintln!("Warmup complete.");
+                    eprintln!("Pre-warming GPU kernels (spatial attention, GEMMs, norms, decoders for {warmup_lights} lights)...");
+                    let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/pipeline".into());
+                    net.warmup(warmup_lights)?;
+                    drop(warmup_profile);
+                    if !cli.no_kernel_cache {
+                        kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
+                    }
+                    eprintln!("Warmup complete.");
+                }
             }
-            for object in objects {
+            for (obj_idx, object) in objects.into_iter().enumerate() {
                 let out = if batch {
                     out.join(
                         object
@@ -234,12 +305,15 @@ fn main() -> Result<()> {
                 let normal = input.restore(&normal);
                 drop(restore_profile);
                 let save_profile = unimsps::profile::phase(&net.device, || "output/encode-and-save".into());
-                save(&normal, &out)?;
+                save_with_formats(&normal, &out, save_formats)?;
                 drop(save_profile);
+                if obj_idx == 0 && !cli.no_kernel_cache && !cli.cpu {
+                    kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
+                }
                 std::fs::write(
                     out.join("metadata.json"),
                     serde_json::to_vec_pretty(
-                        &serde_json::json!({"width":normal.w,"height":normal.h,"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"encoder_batch":cli.encoder_batch,"pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,"optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,"pool_cache_mib":cli.pool_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
+                        &serde_json::json!({"width":normal.w,"height":normal.h,"formats":save_formats.names(),"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"api":effective_api,"encoder_batch":cli.encoder_batch,"pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,"optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,"pool_cache_mib":cli.pool_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
                     )?,
                 )?;
                 println!(
@@ -248,13 +322,13 @@ fn main() -> Result<()> {
                     start.elapsed().as_secs_f64()
                 );
                 unimsps::profile::write_report(&out.join("profile.json"), serde_json::json!({
-                    "device": format!("{:?}", net.device.identity()), "api": cli.api,
+                    "device": format!("{:?}", net.device.identity()), "api": effective_api,
                     "precision": format!("{dtype:?}"), "images": input.images.len(),
                     "padded_size": input.size, "encoder_batch": cli.encoder_batch,
                     "pixel_batch": net.options.pixel_batch, "query_batch": cli.query_batch,
                     "image_cache_mib": cli.image_cache_mib, "unfused_attention": !net.options.fused_attention,
                     "fused_attention": net.options.fused_attention, "score_budget_mib": net.options.score_budget_mib,
-                    "queue_depth": cli.queue_depth,
+                    "queue_depth": cli.queue_depth, "formats": save_formats.names(),
                     "fused_softmax": net.options.fused_softmax, "optimized_encoder": net.options.optimized_encoder, "gemm_convolutions": net.options.gemm_convolutions, "pool_cache_mib": cli.pool_cache_mib,
                     "object": object, "model": model,
                 }))?;
@@ -312,5 +386,8 @@ fn main() -> Result<()> {
             );
         }
     }
+    let total_secs = program_start.elapsed().as_secs_f64();
+    eprintln!("Total run time: {total_secs:.2}s");
+    println!("Total run time: {total_secs:.2}s");
     Ok(())
 }

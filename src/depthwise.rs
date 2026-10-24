@@ -1,3 +1,4 @@
+#![allow(unstable_name_collisions)]
 //! Direct 3x3 depthwise convolution on [batch, spatial token, channel].
 //! No NCHW materialization; FP32 accumulation and native output precision.
 use burn::tensor::Tensor as BurnTensor;

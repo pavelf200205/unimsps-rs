@@ -85,7 +85,9 @@ fn short_attention<F: Float>(
         for j in 0..slots {
             let channel = lane + j * plane;
             if valid && channel < width {
-                out[row * width + channel] = F::cast_from(accum[j] / denominator);
+                // Fuse the MAB residual `q + attention(q, kv)` directly in registers.
+                out[row * width + channel] =
+                    F::cast_from(queries[j]) + F::cast_from(accum[j] / denominator);
             }
         }
     }

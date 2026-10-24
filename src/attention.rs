@@ -34,6 +34,19 @@ fn unavailable() -> &'static Mutex<HashSet<String>> {
     CACHE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+pub(crate) fn load_unavailable(keys: impl IntoIterator<Item = String>) {
+    if let Ok(mut set) = unavailable().lock() {
+        set.extend(keys);
+    }
+}
+
+pub(crate) fn snapshot_unavailable() -> Vec<String> {
+    unavailable()
+        .lock()
+        .map(|set| set.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 fn problem_key(q: &BurnTensor<4>, k: &BurnTensor<4>) -> String {
     format!("{:?}/{:?}/{:?}/{:?}", q.device().identity(), q.dtype(), q.dims(), k.dims())
 }

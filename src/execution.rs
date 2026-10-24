@@ -3,8 +3,8 @@
 use burn::tensor::Device;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-static QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
-static POOL_CACHE_BYTES: AtomicUsize = AtomicUsize::new(1536 * 1024 * 1024);
+static QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(1);
+static POOL_CACHE_BYTES: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024);
 
 pub fn configure(depth: usize) { QUEUE_DEPTH.store(depth, Ordering::Relaxed); }
 pub fn depth() -> usize { QUEUE_DEPTH.load(Ordering::Relaxed) }
@@ -47,4 +47,10 @@ pub(crate) fn finish(device: &Device) {
     if depth() != 0 && !crate::profile::enabled() {
         device.sync().expect("GPU completion failed at inference queue boundary");
     }
+}
+
+pub(crate) fn cleanup_view(device: &Device) {
+    let _ = device.flush();
+    let _ = device.sync();
+    device.memory_cleanup();
 }

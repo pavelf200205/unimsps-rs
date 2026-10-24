@@ -172,3 +172,99 @@ pub(crate) fn forward(
         .outputs();
     Some(BurnTensor::from_primitive::<Gpu>(out))
 }
+
+#[cube(launch)]
+fn normalize_3ch_kernel<F: Float>(
+    x: &Tensor<F>,
+    out: &mut Tensor<f32>,
+    pixels: usize,
+) {
+    let i = usize::cast_from(ABSOLUTE_POS_X + ABSOLUTE_POS_Y * CUBE_COUNT_X * CUBE_DIM_X);
+    if i < pixels {
+        let w = x.shape(3);
+        let y = i / w;
+        let xx = i % w;
+        let spatial = y * x.stride(2) + xx * x.stride(3);
+        let c_stride = x.stride(1);
+        let nx = f32::cast_from(x[spatial]);
+        let ny = f32::cast_from(x[c_stride + spatial]);
+        let nz = f32::cast_from(x[2 * c_stride + spatial]);
+        let norm_sq = nx * nx + ny * ny + nz * nz;
+        let inv = 1.0_f32 / f32::max(f32::sqrt(norm_sq), 1e-12_f32);
+        out[i] = nx * inv;
+        out[pixels + i] = ny * inv;
+        out[2 * pixels + i] = nz * inv;
+    }
+}
+
+#[derive(Debug)]
+struct Normalize3ChOp {
+    desc: CustomOpIr,
+}
+
+impl Operation<FusionCubeRuntime> for Normalize3ChOp {
+    fn execute(&self, handles: &mut HandleContainer<CubeFusionHandle>) -> Result<(), ExecutionError> {
+        let ([x], [output]) = self.desc.as_fixed();
+        let x = handles.get_float_tensor::<CubeBackend>(x);
+        let [_, _, h, w] = x.meta.shape().dims::<4>();
+        let pixels = h * w;
+        let client = x.client.clone();
+        let hw = &client.properties().hardware;
+        let groups = pixels.div_ceil(128);
+        let max_gx = (hw.max_cube_count.0 as usize).max(1);
+        let gy = groups.div_ceil(max_gx).max(1);
+        let gx = groups.div_ceil(gy).max(1);
+        if gy > hw.max_cube_count.1 as usize {
+            return Err(ExecutionError::generic("Normalize3Ch dispatch exceeds device grid limits"));
+        }
+        let result = empty_device_contiguous_dtype(
+            client.clone(),
+            x.device.clone(),
+            x.meta.shape().clone(),
+            DType::F32,
+        );
+        let count = CubeCount::Static(gx as u32, gy as u32, 1);
+        let dim = CubeDim::new_1d(128);
+        match x.dtype {
+            DType::F16 => normalize_3ch_kernel::launch::<half::f16>(
+                &client,
+                count,
+                dim,
+                x.into_tensor_arg(),
+                result.clone().into_tensor_arg(),
+                pixels,
+            ),
+            DType::F32 => normalize_3ch_kernel::launch::<f32>(
+                &client,
+                count,
+                dim,
+                x.into_tensor_arg(),
+                result.clone().into_tensor_arg(),
+                pixels,
+            ),
+            _ => return Err(ExecutionError::generic("Unsupported normalize_3ch dtype")),
+        }
+        handles.register_float_tensor::<CubeBackend>(&output.id, result);
+        Ok(())
+    }
+}
+
+pub(crate) fn normalize_3ch(x: BurnTensor<4>) -> Option<BurnTensor<4>> {
+    let [b, c, _, _] = x.dims();
+    if b != 1 || c != 3 {
+        return None;
+    }
+    let prim = x.inner().try_into_primitive::<Gpu>().ok()?;
+    let client = prim.client.clone();
+    let compute_client = client.device().client();
+    let hw = &compute_client.properties().hardware;
+    if hw.max_units_per_cube < 128 || hw.max_cube_dim.0 < 128 {
+        return None;
+    }
+    let out = TensorIr::uninit(client.create_empty_handle(), prim.shape.clone(), DType::F32);
+    let desc = CustomOpIr::with_scalars("unimsps_normalize_3ch", &[prim.into_ir()], &[out], vec![]);
+    let [out] = client
+        .register(StreamId::current(), OperationIr::Custom(desc.clone()), Normalize3ChOp { desc })
+        .outputs();
+    Some(BurnTensor::from_primitive::<Gpu>(out))
+}
