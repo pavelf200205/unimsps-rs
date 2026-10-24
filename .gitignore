@@ -11,3 +11,4 @@ __pycache__/
 *.f32
 /.cargo/
 unimsps-rs.zip
+timings*

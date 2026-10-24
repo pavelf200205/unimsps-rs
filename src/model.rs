@@ -21,6 +21,39 @@ struct ActiveMask {
     padded_len: usize,
 }
 
+/// 2D separable Chebyshev box dilation of a boolean mask by `radius` pixels.
+fn dilate_mask_2d(mask: &[bool], h: usize, w: usize, radius: usize) -> Vec<bool> {
+    if radius == 0 {
+        return mask.to_vec();
+    }
+    let mut horiz = vec![false; h * w];
+    for y in 0..h {
+        let row = &mask[y * w..(y + 1) * w];
+        let dst = &mut horiz[y * w..(y + 1) * w];
+        for x in 0..w {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius + 1).min(w);
+            dst[x] = row[x0..x1].iter().any(|&v| v);
+        }
+    }
+    let mut out = vec![false; h * w];
+    for y in 0..h {
+        let y0 = y.saturating_sub(radius);
+        let y1 = (y + radius + 1).min(h);
+        for x in 0..w {
+            let mut any = false;
+            for yy in y0..y1 {
+                if horiz[yy * w + x] {
+                    any = true;
+                    break;
+                }
+            }
+            out[y * w + x] = any;
+        }
+    }
+    out
+}
+
 fn effective_pixel_batch(requested: usize) -> usize {
     // Map legacy 5000 / 4096 chunk defaults to 65536 so full patches fit in a single batch.
     if requested == 5000 || requested == 4096 {
@@ -591,12 +624,15 @@ impl Model {
         ));
         let out_n = if pool { 1 } else { n };
         if let Some(mask) = active_mask {
-            let mut processed = self.set_layer(x_gathered, p, pool);
-            if mask.padded_len > mask.valid_len {
-                processed = processed.slice([0..mask.valid_len, 0..out_n, 0..c]);
-            }
-            let zeros = Tensor::zeros([total_pixels, out_n, c], self.tensor_options());
-            zeros.select_assign(0, mask.scatter_idx.clone(), processed, burn::tensor::IndexingUpdateOp::Add)
+            let processed = self.set_layer(x_gathered, p, pool);
+            let fg = processed.clone().slice([0..mask.valid_len, 0..out_n, 0..c]);
+            // Slot `mask.valid_len` holds an evaluated representative deep-background token.
+            // Broadcasting its output instead of zeros preserves exact features for subsequent
+            // global spatial self-attention blocks and U-Net decoder skip connections.
+            let bg = processed.slice([mask.valid_len..mask.valid_len + 1, 0..out_n, 0..c]);
+            let base = bg.clone().repeat_dim(0, total_pixels);
+            let delta = fg - bg.repeat_dim(0, mask.valid_len);
+            base.select_assign(0, mask.scatter_idx.clone(), delta, burn::tensor::IndexingUpdateOp::Add)
         } else {
             self.set_layer(x_gathered, p, pool)
         }
@@ -674,10 +710,17 @@ impl Model {
             let oh = if i == 0 { ih } else { ih / 2 };
             let ow = if i == 0 { iw } else { iw / 2 };
             let mask_profile = crate::profile::span(&self.device, || format!("mask/prepare-stage {}", i + 1));
-            if i > 0 {
+            if i == 0 {
                 if let Some(prev) = current_mask.take() {
-                    // Downsample mask by 2x (max-pooling 3x3 stride 2 pad 1 to match conv3x3 stride 2)
-                    let mut next_mask = vec![false; oh * ow];
+                    // Dilate by Chebyshev radius 6 at Stage 0: 2px for 2x bilinear prior normal
+                    // upsampling + 1px for patch_embed1 (3x3) + 3px for three block1 3x3 dwconvs.
+                    current_mask = Some(dilate_mask_2d(&prev, oh, ow, 6));
+                }
+            } else if i == 1 {
+                if let Some(prev) = current_mask.take() {
+                    // Downsample by 2x (3x3 stride 2 pad 1 max-pool to match patch_embed2)
+                    // then dilate by radius 4 for the four block2 3x3 dwconvs.
+                    let mut downsampled = vec![false; oh * ow];
                     for y in 0..oh {
                         for x in 0..ow {
                             let sy = 2 * y;
@@ -692,28 +735,46 @@ impl Model {
                                 }
                                 if any { break; }
                             }
-                            next_mask[y * ow + x] = any;
+                            downsampled[y * ow + x] = any;
                         }
                     }
-                    current_mask = Some(next_mask);
+                    current_mask = Some(dilate_mask_2d(&downsampled, oh, ow, 4));
                 }
+            } else {
+                // Stages 2 (64x64 = 4096) and 3 (32x32 = 1024) are already single-bucket sizes
+                // where cumulative convolutional & border halos cover most of the grid.
+                current_mask = None;
             }
+            let border = if i == 0 { 4 } else { 7 };
             let active_mask = current_mask.as_ref().and_then(|m| {
-                let keep_count = m.iter().filter(|&&k| k).count();
-                // Only use gather/scatter when it saves at least 10% of pixels and is non-empty
-                if keep_count == 0 || keep_count * 10 >= m.len() * 9 {
+                if i >= 2 || oh <= 64 || ow <= 64 || oh <= 2 * border || ow <= 2 * border {
                     return None;
                 }
-                let indices: Vec<i32> = m
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, &keep)| if keep { Some(idx as i32) } else { None })
-                    .collect();
+                let mut indices = Vec::with_capacity(m.len());
+                let mut bg_pixel: Option<i32> = None;
+                for y in 0..oh {
+                    let on_y_border = y < border || y + border >= oh;
+                    for x in 0..ow {
+                        let idx = y * ow + x;
+                        let on_border = on_y_border || x < border || x + border >= ow;
+                        if m[idx] || on_border {
+                            indices.push(idx as i32);
+                        } else if bg_pixel.is_none() {
+                            bg_pixel = Some(idx as i32);
+                        }
+                    }
+                }
+                let bg_pixel = bg_pixel?;
                 let valid_len = indices.len();
-                let full_chunks = (valid_len / batch_limit) * batch_limit;
-                let rem = valid_len - full_chunks;
+                let gather_len = valid_len + 1;
+                // Only use gather/scatter when it saves at least 10% of pixels and is non-empty
+                if valid_len == 0 || gather_len * 10 >= m.len() * 9 {
+                    return None;
+                }
+                let full_chunks = (gather_len / batch_limit) * batch_limit;
+                let rem = gather_len - full_chunks;
                 let padded_len = if rem == 0 {
-                    valid_len
+                    gather_len
                 } else {
                     full_chunks + static_bucket_size(rem, batch_limit)
                 };
@@ -721,16 +782,14 @@ impl Model {
                     TensorData::new(indices.clone(), [valid_len]),
                     &self.device,
                 );
-                let gather_idx = if padded_len > valid_len {
-                    let mut padded = indices;
-                    padded.resize(padded_len, 0);
-                    Tensor::<1, burn::tensor::Int>::from_data(
-                        TensorData::new(padded, [padded_len]),
-                        &self.device,
-                    )
-                } else {
-                    scatter_idx.clone()
-                };
+                // Slot `valid_len` (and any static bucket padding) evaluates the representative
+                // deep-background pixel `bg_pixel` so all ungathered tokens get its exact output.
+                let mut padded = indices;
+                padded.resize(padded_len, bg_pixel);
+                let gather_idx = Tensor::<1, burn::tensor::Int>::from_data(
+                    TensorData::new(padded, [padded_len]),
+                    &self.device,
+                );
                 Some(ActiveMask {
                     gather_idx,
                     scatter_idx,

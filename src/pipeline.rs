@@ -355,8 +355,15 @@ impl Operation<FusionCubeRuntime> for Upsample2xOp {
         let input = handles.get_float_tensor::<CubeBackend>(input);
         let [b, c, h, w] = input.meta.shape().dims::<4>();
         let client = input.client.clone();
+        let hw = &client.properties().hardware;
         let total = c * (2 * h) * (2 * w);
-        let count = CubeCount::Static((total.div_ceil(128)) as u32, 1, 1);
+        let groups = total.div_ceil(128);
+        let gy = groups.div_ceil((hw.max_cube_count.0 as usize).max(1)).max(1);
+        let gx = groups.div_ceil(gy).max(1);
+        if gy > hw.max_cube_count.1 as usize {
+            return Err(ExecutionError::generic("Upsample2x dispatch exceeds device grid limits"));
+        }
+        let count = CubeCount::Static(gx as u32, gy as u32, 1);
         let dim = CubeDim::new_1d(128);
         let out_shape = [b, c, 2 * h, 2 * w];
         let result = empty_device_contiguous_dtype(
@@ -428,7 +435,7 @@ fn stage_device(
         (images, is_6ch)
     };
     let raw = model.forward_masked(images, refinement, host_mask)?;
-    Ok(raw.cast(model.options.dtype).mask_fill(keep_mask.bool_not(), 0.))
+    Ok(raw.mask_fill(keep_mask.bool_not(), 0.))
 }
 
 /// Four global stages followed by 256px patches/128px stride.
@@ -493,7 +500,7 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
         for y in 0..256 { for x in 0..256 {
             values.push(half::f16::from_f64(g[y] * g[x] / denominator).to_f32());
         }}
-        gaussian = Some(tensor(values, [1, 1, 256, 256], &model.device).cast(model.options.dtype));
+        gaussian = Some(tensor(values, [1, 1, 256, 256], &model.device));
     }
 
     drop(prepare_profile);
@@ -524,7 +531,7 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
             res
         } else {
             let prior = prior.context("Refinement requires previous normals")?;
-            let mut out = Tensor::zeros([1, 3, size, size], model.tensor_options());
+            let mut out = Tensor::zeros([1, 3, size, size], &model.device);
             let total = ((size - 256) / 128 + 1).pow(2);
             let mut count = 0;
             let mut patch_host_mask = vec![false; 256 * 256];
@@ -578,7 +585,7 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     };
                     let prediction = stage_device(model, images, n_opt, patch_mask, host_mask_slice)?;
                     let blend_profile = crate::profile::span(&model.device, || format!("patch/blend size={size}"));
-                    let weighted = prediction.cast(model.options.dtype) * gaussian.as_ref().unwrap().clone();
+                    let weighted = prediction * gaussian.as_ref().unwrap().clone();
                     let region = [0..1, 0..3, y..y + 256, x..x + 256];
                     let updated = out.clone().slice(region.clone()) + weighted;
                     out = out.slice_assign(region, updated);
@@ -591,6 +598,9 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                 }
             }
             crate::execution::finish(&model.device);
+            if i + 1 < stages {
+                out = out.mask_fill(mask.clone().bool_not(), 0.);
+            }
             out
         });
         if i + 1 == stages { final_mask = Some(mask); }
