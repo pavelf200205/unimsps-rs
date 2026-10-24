@@ -3,7 +3,7 @@ use burn::tensor::{Device, DeviceKind, FloatDType};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use unimsps::{
-    cache::{default_cache_dir, init_environment, configure_runtime, build_id},
+    cache::{default_cache_dir, init_environment, configure_runtime, build_id, checkpoint_and_report},
     model::{Model, ModelOptions, read_tensor, tensor},
     pipeline::{Input, ProcessOptions, SaveFormats, process_with_options, save_with_formats},
 };
@@ -272,7 +272,10 @@ fn main() -> Result<()> {
                 }
                 // Drain all lazy fusion work before leaving compile-only mode (warmup syncs).
                 drop(warmup_profile);
-                if !cli.no_kernel_cache { kernel_cache.record_and_save(&cache_dir,Some(cache_signature.clone())); }
+                if !cli.no_kernel_cache {
+                    kernel_cache.record_and_save(&cache_dir,Some(cache_signature.clone()));
+                    checkpoint_and_report("after preparation");
+                }
                 eprintln!("Kernel preparation complete; normal inference executes on the GPU.");
             }
             for (obj_idx, object) in objects.into_iter().enumerate() {
@@ -384,6 +387,7 @@ fn main() -> Result<()> {
             );
         }
     }
+    if !cli.no_kernel_cache && !cli.cpu { checkpoint_and_report("exit"); }
     let total_secs = program_start.elapsed().as_secs_f64();
     eprintln!("Total run time: {total_secs:.2}s");
     println!("Total run time: {total_secs:.2}s");

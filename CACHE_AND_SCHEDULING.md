@@ -64,3 +64,38 @@ Do not reuse a cache marker as evidence of successful artifact retrieval.
 This change was inspected in source only. No compilation, inference, benchmarks
 or numerical comparisons were executed by the coding agent. Startup savings,
 steady-state speed, driver behavior and VRAM consumption remain to be measured.
+
+# Windows persistence repair
+
+A zero-byte main .db with no WAL sidecar was traced to the installed
+cubecl-environment 0.11.0 opening Turso 0.8.3 with experimental multiprocess WAL.
+Turso's default WindowsIO lacks shared-WAL byte-locking/mapping primitives, and
+database initialization is rejected. CubeCL silently falls back to MemoryStorage
+when its log warnings have no installed sink.
+
+The repository-local Cargo patch in vendor/cubecl-environment disables that
+experimental mode on Windows only. Normal Windows database locking remains in
+use; Unix multiprocess WAL is unchanged. Concurrent Windows instances should
+use separate cache directories, since the default Windows backend locks the
+cache file rather than supporting concurrent multiprocess WAL writers.
+The patch does not modify the global Cargo registry or neural inference code.
+
+A cache-only warning logger now exposes database failures. Startup explicitly
+opens the active database, writes and reads a small probe if absent, and reports
+whether it found the probe from an earlier process. This checks real durable
+storage rather than a JSON warmup marker. Namespace statistics report compiled
+artifacts, autotune decisions and payload bytes at startup, after preparation
+and at normal exit.
+
+Turso does not automatically checkpoint on close. An explicit checkpoint after
+preparation and at exit folds committed WAL frames into the main .db. While a
+program is running, an unchanged/small .db alone does not imply failure: entries
+may still be in the -wal sidecar. Never remove a live -wal file. A failed/busy
+checkpoint is reported; the committed WAL remains part of the database.
+
+After rebuilding, the first run creates a new environment (build ID changes).
+On a second run of that exact binary with identical options, look for
+previous-process probe: found and nonzero compiled-artifact/tuning counts at
+startup. Preparation still replays shapes to hydrate process-local pipelines.
+The agent did not compile, open the database through Turso, or run inference;
+the repair is based on source inspection and must be verified by the user's run.

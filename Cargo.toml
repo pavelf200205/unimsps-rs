@@ -16,6 +16,8 @@ burn-cubecl = { version = "=0.22.0", default-features = false, features = ["std"
 burn-fusion = { version = "=0.22.0", default-features = false, features = ["std"] }
 cubek = { version = "=0.3.0", default-features = false, features = ["attention"] }
 cubecl = { version = "=0.11.0", default-features = false, features = ["std", "vulkan", "persistence"] }
+cubecl-environment = { version = "=0.11.0", default-features = false, features = ["std", "persistence"] }
+log = "0.4"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,3 +29,7 @@ rayon = "1.12"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Local Windows persistence workaround; no global registry edits.
+[patch.crates-io]
+cubecl-environment = { path = "vendor/cubecl-environment" }
