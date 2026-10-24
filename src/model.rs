@@ -16,7 +16,7 @@ enum Weight {
 
 struct ActiveMask {
     gather_idx: Tensor<1, burn::tensor::Int>,
-    scatter_idx: Tensor<1, burn::tensor::Int>,
+    inverse_idx: Tensor<1, burn::tensor::Int>,
     valid_len: usize,
     padded_len: usize,
 }
@@ -30,27 +30,11 @@ fn effective_pixel_batch(requested: usize) -> usize {
     }
 }
 
-/// Borrowed from `supernormal-rs` (`Field::static_bucket_size`):
-/// Restricts set-transformer batch sizes to `{256, 1024, 2048, 4096}` instead of 20 linear
-/// multiples of 256 (`256..5000`), eliminating ~80% of dynamic shape compilations and autotuning.
+/// Small stable power-of-two buckets. Never pad tiny coarse stages to 4096.
 #[inline]
 fn static_bucket_size(valid_pixels: usize, max_batch: usize) -> usize {
-    if valid_pixels >= max_batch || max_batch <= 4096 {
-        return valid_pixels.max(max_batch.min(4096));
-    }
-    // Restrict set-transformer buckets to {4096, 16384, 32768, 65536} (matching the encoder stage
-    // token counts 64x64=4096, 128x128=16384, 256x256=65536 plus 32768) so Burn's Fusion JIT and
-    // GEMM autotuner reuse already-compiled stage shapes instead of compiling new kernels mid-run.
-    for &b in &[4096usize, 16384, 32768, 65536] {
-        if valid_pixels <= b && b <= max_batch {
-            return b;
-        }
-    }
-    valid_pixels
-        .checked_next_power_of_two()
-        .unwrap_or(max_batch)
-        .min(max_batch)
-        .max(valid_pixels)
+    if valid_pixels >= max_batch || max_batch < 256 { return valid_pixels; }
+    valid_pixels.max(256).checked_next_power_of_two().unwrap_or(max_batch).min(max_batch).max(valid_pixels)
 }
 
 #[derive(Clone, Debug)]
@@ -625,15 +609,14 @@ impl Model {
         ));
         let out_n = if pool { 1 } else { n };
         if let Some(mask) = active_mask {
-            let processed = self.set_layer(x_gathered, p, pool);
-            // Scatter the full bucket-sized `processed` [padded_len, out_n, c] without slicing to the
-            // unbucketed `valid_len`: padding indices in `scatter_idx` point to the extra trash slot
-            // at index `total_pixels`, which is sliced off afterwards. This guarantees zero per-patch
-            // Fusion kernel recompilations and 100% buffer reuse in the memory pool across viewpoints.
-            let zeros = Tensor::zeros([total_pixels + 1, out_n, c], self.tensor_options());
-            zeros
-                .select_assign(0, mask.scatter_idx.clone(), processed, burn::tensor::IndexingUpdateOp::Add)
-                .slice([0..total_pixels, 0..out_n, 0..c])
+            let processed = self.set_layer(x_gathered,p,pool);
+            let _scatter_profile = crate::profile::span(&self.device, || format!("layout/inverse-scatter {p}"));
+            if let Some(out) = crate::remap::forward(processed.clone(),mask.inverse_idx.clone()) { return out; }
+            // Non-Cube backend fallback: only unique valid rows are scattered.
+            let processed = processed.slice([0..mask.valid_len,0..out_n,0..c]);
+            let indices = mask.gather_idx.clone().slice([0..mask.valid_len]);
+            Tensor::zeros([total_pixels,out_n,c],self.tensor_options())
+                .select_assign(0,indices,processed,burn::tensor::IndexingUpdateOp::Add)
         } else {
             self.set_layer(x_gathered, p, pool)
         }
@@ -657,7 +640,7 @@ impl Model {
         }
 
         // 3. Warm Net_stage (256x256 patch refinement stage)
-        // With an active circular mask to exercise foreground token gathering and set-transformer buckets
+        // A representative mask; individual sparse bucket paths are warmed explicitly below.
         let dummy_stage = Tensor::zeros([lights, 6, 256, 256], self.tensor_options());
         let mut mask256 = vec![false; 256 * 256];
         for y in 32..224 {
@@ -670,8 +653,27 @@ impl Model {
         // 4. Warm dense Net_stage (full 256x256 patch without masking)
         let _ = self.forward_masked(dummy_stage, true, None)?;
 
+        // Exercise every sparse pool bucket before any timed view. The zero
+        // input is shape-only during compile-only replay; light networks stay dense.
+        for stage in 0..4 {
+            let channels = [64,128,256,512][stage];
+            let spatial = [65536,16384,4096,1024][stage];
+            for &bucket in &[256,512,1024,2048,4096,8192,16384,32768] {
+                if bucket >= spatial || bucket > self.options.pixel_batch { continue; }
+                let prefix = format!("Net_stage.pool_block{}",stage+1);
+                let dummy = Tensor::zeros([bucket,lights,channels],self.tensor_options());
+                let processed = self.set_layer(dummy.clone(),&prefix,true);
+                let indices = Tensor::<1,burn::tensor::Int>::from_data(TensorData::new(vec![0_i32;bucket],[bucket]),&self.device);
+                let inverse = Tensor::<1,burn::tensor::Int>::from_data(TensorData::new(vec![-1_i32;spatial],[spatial]),&self.device);
+                let gather_warm = crate::remap::forward(dummy,indices);
+                let scatter_warm = crate::remap::forward(processed,inverse);
+                self.device.flush().map_err(|e|anyhow::anyhow!("Sparse warmup submission failed: {e:?}"))?;
+                drop((gather_warm,scatter_warm));
+            }
+        }
+
         // 5. Ensure all pipeline shader compilations and autotunings complete
-        self.device.sync().ok();
+        self.device.sync().map_err(|e|anyhow::anyhow!("Warmup GPU completion failed: {e:?}"))?;
         Ok(())
     }
 
@@ -763,50 +765,26 @@ impl Model {
                 current_mask = Some(next_mask);
             }
             let active_mask = current_mask.as_ref().and_then(|m| {
-                // Stages 2 (64x64 = 4096) and 3 (32x32 = 1024) are already <= the minimum 4096 bucket.
-                if i >= 2 || m.len() <= 4096 {
-                    return None;
-                }
-                let keep_count = m.iter().filter(|&&k| k).count();
-                if keep_count == 0 || keep_count * 10 >= m.len() * 9 {
-                    return None;
-                }
+                let keep_count = m.iter().filter(|&&k|k).count();
+                if keep_count == 0 || keep_count * 10 >= m.len() * 9 { return None; }
                 let valid_len = keep_count;
                 let full_chunks = (valid_len / batch_limit) * batch_limit;
                 let rem = valid_len - full_chunks;
-                let padded_len = if rem == 0 {
-                    valid_len
-                } else {
-                    full_chunks + static_bucket_size(rem, batch_limit)
-                };
-                if padded_len >= m.len() {
-                    return None;
-                }
-                let mut gather_indices: Vec<i32> = Vec::with_capacity(padded_len);
-                for (idx, &keep) in m.iter().enumerate() {
+                let padded_len = full_chunks + if rem == 0 { 0 } else { static_bucket_size(rem,batch_limit) };
+                if padded_len >= m.len() { return None; }
+                let mut gather = Vec::with_capacity(padded_len);
+                let mut inverse = vec![-1_i32;m.len()];
+                for (pixel,&keep) in m.iter().enumerate() {
                     if keep {
-                        gather_indices.push(idx as i32);
+                        inverse[pixel] = gather.len() as i32;
+                        gather.push(pixel as i32);
                     }
                 }
-                let mut scatter_indices = gather_indices.clone();
-                if padded_len > valid_len {
-                    gather_indices.resize(padded_len, 0);
-                    // Route padded slots to the trash slot at `m.len()` (`total_pixels`).
-                    scatter_indices.resize(padded_len, m.len() as i32);
-                }
-                let gather_idx = Tensor::<1, burn::tensor::Int>::from_data(
-                    TensorData::new(gather_indices, [padded_len]),
-                    &self.device,
-                );
-                let scatter_idx = Tensor::<1, burn::tensor::Int>::from_data(
-                    TensorData::new(scatter_indices, [padded_len]),
-                    &self.device,
-                );
+                gather.resize(padded_len,0);
                 Some(ActiveMask {
-                    gather_idx,
-                    scatter_idx,
-                    valid_len,
-                    padded_len,
+                    gather_idx: Tensor::<1,burn::tensor::Int>::from_data(TensorData::new(gather,[padded_len]),&self.device),
+                    inverse_idx: Tensor::<1,burn::tensor::Int>::from_data(TensorData::new(inverse,[m.len()]),&self.device),
+                    valid_len,padded_len,
                 })
             });
 
@@ -853,7 +831,8 @@ impl Model {
             // `pool_block` outputs only enter the local convolutional U-Net decoder, so gathering
             // the exact decoder backward cone `active_mask` is 100% lossless (0.0 error on kept pixels).
             let x_pool = if let Some(ref mask) = active_mask {
-                x.clone().select(0, mask.gather_idx.clone())
+                crate::remap::forward(x.clone(),mask.gather_idx.clone())
+                    .unwrap_or_else(||x.clone().select(0,mask.gather_idx.clone()))
             } else {
                 x.clone()
             };

@@ -538,6 +538,7 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
             let mut out = Tensor::zeros([1, 3, size, size], &model.device);
             let total = ((size - 256) / 128 + 1).pow(2);
             let mut count = 0;
+            let mut submitted = 0;
             let mut patch_host_mask = vec![false; 256 * 256];
             let is_final_scale = i + 1 == stages;
             let lights = input.images.len();
@@ -621,12 +622,13 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     drop(blend_profile);
                     // Submit outstanding fusion work and bound pool reservation without per-chunk stalls.
                     model.device.flush().map_err(|e| anyhow::anyhow!("GPU submission failed: {e:?}"))?;
-                    crate::execution::trim_memory(&model.device);
-                    crate::execution::checkpoint(&model.device, count);
+                    submitted += 1;
+                    crate::execution::checkpoint_patch(&model.device, submitted);
                     eprintln!("  Patch {count}/{total} {}", if crate::execution::depth() != 0 || crate::profile::enabled() { "completed" } else { "queued" });
                 }
             }
-            crate::execution::finish(&model.device);
+            crate::execution::checkpoint_patch(&model.device, submitted);
+            crate::execution::trim_memory(&model.device);
             out
         });
         if i + 1 == stages { final_mask = Some(mask); }

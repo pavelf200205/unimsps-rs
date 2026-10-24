@@ -224,3 +224,10 @@ weights are prepared once during load. --burn-convolutions restores Burn's
 convolution dispatch for these layers and skips the extra packed weights.
 Use normal runs to compare throughput and --verbose separately to inspect
 conv-pack and conv-matmul costs. This source change has not been built or timed.
+
+## Persistent preparation update
+
+See [CACHE_AND_SCHEDULING.md](CACHE_AND_SCHEDULING.md) for the current cache,
+compile-only startup replay, sparse remapping and queue/memory policies. This
+supersedes earlier claims that a workload marker can skip all warmup. A rebuild
+is required to enable the Vulkan compiler and runtime persistence features.

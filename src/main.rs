@@ -3,7 +3,7 @@ use burn::tensor::{Device, DeviceKind, FloatDType};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use unimsps::{
-    cache::{default_cache_dir, init_environment},
+    cache::{default_cache_dir, init_environment, configure_runtime, build_id},
     model::{Model, ModelOptions, read_tensor, tensor},
     pipeline::{Input, ProcessOptions, SaveFormats, process_with_options, save_with_formats},
 };
@@ -14,7 +14,7 @@ struct Cli {
     /// Detailed synchronized CPU/GPU wall timings; writes profile.json. Slows execution.
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
-    /// Maximum chunks queued between synchronous GPU waits; 0 uses asynchronous submission.
+    /// Maximum complete patches between GPU waits; inner chunks submit asynchronously; 0 is unbounded.
     #[arg(long, default_value_t = 1, global = true)]
     queue_depth: usize,
     #[arg(long, global = true)]
@@ -53,7 +53,7 @@ struct Cli {
     /// Retain Burn convolution dispatch for spatial reductions and stride-2 embeddings.
     #[arg(long, global = true)]
     burn_convolutions: bool,
-    /// Allocator reservation threshold for cleanup; 0 retains cached buffers (default: 1024 MiB).
+    /// Unused allocator cache threshold at scale boundaries; 0 disables trimming (default: 1024 MiB).
     #[arg(long, default_value_t = 1024, global = true)]
     pool_cache_mib: usize,
     /// Force custom subgroup fused spatial attention instead of standard hardware GEMM.
@@ -68,7 +68,7 @@ struct Cli {
     /// Comma-separated normal map formats to save: exr, png, mat, f32, or all (default: exr,png).
     #[arg(long, visible_aliases = ["format", "save-formats", "save_formats"], value_delimiter = ',', default_value = "exr,png", global = true)]
     formats: Vec<String>,
-    /// Directory used to persist compiled GPU shaders, CUDA JIT binaries, and warmup state across runs.
+    /// Directory for persistent compiled kernels, autotune choices, and workload metadata.
     #[arg(long, visible_aliases = ["cache-dir", "cache_dir"], global = true)]
     kernel_cache_dir: Option<PathBuf>,
     /// Disable persistent GPU kernel caching across runs.
@@ -114,6 +114,7 @@ fn main() -> Result<()> {
     unimsps::execution::configure_pool_cache(cli.pool_cache_mib);
 
     let cache_dir = cli.kernel_cache_dir.clone().unwrap_or_else(default_cache_dir);
+    configure_runtime(&cache_dir, !cli.no_kernel_cache && !cli.cpu);
     let mut kernel_cache = if !cli.no_kernel_cache && !cli.cpu {
         init_environment(&cache_dir, cli.kernel_cache_dir.is_some())
     } else {
@@ -251,31 +252,28 @@ fn main() -> Result<()> {
                 cli.encoder_batch
             };
             let cache_signature = format!(
-                "{:?}|{}|{:?}|eb={}|pb={}|l={}|fa={}|fs={}|oe={}|gc={}",
-                net.device.identity(),
-                effective_api,
-                dtype,
-                cli.encoder_batch,
-                net.options.pixel_batch,
-                warmup_lights,
-                net.options.fused_attention,
-                net.options.fused_softmax,
-                net.options.optimized_encoder,
-                net.options.gemm_convolutions,
+                "{}|{:?}|{}|{:?}|eb={}|pb={}|lights={}|qb={}|scores={}|fa={}|fs={}|oe={}|gc={}",
+                build_id(),net.device.identity(),effective_api,dtype,cli.encoder_batch,
+                net.options.pixel_batch,warmup_lights,net.options.query_batch,net.options.score_budget_mib,
+                net.options.fused_attention,net.options.fused_softmax,net.options.optimized_encoder,net.options.gemm_convolutions,
             );
             if !cli.no_warmup && !cli.cpu {
                 if !cli.no_kernel_cache && kernel_cache.is_warmed(&cache_signature) {
-                    eprintln!("Kernel cache hit for current configuration; skipping pre-warm pass.");
+                    eprintln!("Previously warmed workload: replaying process-local setup from persistent artifacts.");
                 } else {
-                    eprintln!("Pre-warming GPU kernels (spatial attention, GEMMs, norms, decoders for {warmup_lights} lights)...");
-                    let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/pipeline".into());
-                    net.warmup(warmup_lights)?;
-                    drop(warmup_profile);
-                    if !cli.no_kernel_cache {
-                        kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
-                    }
-                    eprintln!("Warmup complete.");
+                    eprintln!("Preparing kernels and tuning for {warmup_lights} lights (first use may be slow)...");
                 }
+                let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/compile-only-replay".into());
+                {
+                    // Shape-driven forward passes only. No output is read or used.
+                    // Autotune measurements still execute when a strategy is missing.
+                    let _compile_only = cubecl::dry_run::DryRun::new();
+                    net.warmup(warmup_lights)?;
+                }
+                // Drain all lazy fusion work before leaving compile-only mode (warmup syncs).
+                drop(warmup_profile);
+                if !cli.no_kernel_cache { kernel_cache.record_and_save(&cache_dir,Some(cache_signature.clone())); }
+                eprintln!("Kernel preparation complete; normal inference executes on the GPU.");
             }
             for (obj_idx, object) in objects.into_iter().enumerate() {
                 let out = if batch {
