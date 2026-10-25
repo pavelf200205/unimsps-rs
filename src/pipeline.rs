@@ -450,14 +450,6 @@ pub fn process(model: &Model, input: &Input) -> Result<Raster> {
 }
 
 pub fn process_with_options(model: &Model, input: &Input, options: ProcessOptions) -> Result<Raster> {
-    // The inner scope owns all per-view GPU tensors. Reclaim only after they
-    // have dropped, including the cached boundary masks and Gaussian weights.
-    let result = process_view(model, input, options);
-    crate::execution::cleanup_view(&model.device);
-    result
-}
-
-fn process_view(model: &Model, input: &Input, options: ProcessOptions) -> Result<Raster> {
     use std::borrow::Cow;
     use rayon::prelude::*;
 
@@ -539,6 +531,7 @@ fn process_view(model: &Model, input: &Input, options: ProcessOptions) -> Result
         normal = Some(if i < 4 {
             let ImageLevel::Device(images) = active else { unreachable!() };
             let res = stage_device(model, images, prior, mask.clone(), Some(&host_mask))?;
+            crate::execution::checkpoint_patch(&model.device, 1);
             crate::execution::trim_memory(&model.device);
             res
         } else {
@@ -550,12 +543,18 @@ fn process_view(model: &Model, input: &Input, options: ProcessOptions) -> Result
             let mut patch_host_mask = vec![false; 256 * 256];
             let is_final_scale = i + 1 == stages;
             let lights = input.images.len();
-            let full_device_images = match &active {
-                ImageLevel::Device(images) => Some(Tensor::cat(
-                    vec![images.clone(), prior.clone().repeat_dim(0, lights)],
-                    1,
-                )),
-                ImageLevel::Host(_) => None,
+            // Move `images` and `prior` directly into `full_device_images` when RGB is on-device
+            // so we do not hold duplicate 36-54 MiB `images` and 6 MiB `prior` tensors across all 49 patches.
+            let (active, prior_host, full_device_images) = match active {
+                ImageLevel::Device(images) => {
+                    let full = Tensor::cat(
+                        vec![images, prior.repeat_dim(0, lights)],
+                        1,
+                    );
+                    crate::execution::finish(&model.device);
+                    (None, None, Some(full))
+                }
+                ImageLevel::Host(host_imgs) => (Some(host_imgs), Some(prior), None),
             };
             for y in (0..=size - 256).step_by(128) {
                 for x in (0..=size - 256).step_by(128) {
@@ -592,6 +591,7 @@ fn process_view(model: &Model, input: &Input, options: ProcessOptions) -> Result
                             continue;
                         }
                     }
+                    let mut patch_trace = crate::trace::Patch::start(size,y,x,fg_count);
                     let _patch_profile = crate::profile::phase(&model.device, || format!("patch/size={size} y={y} x={x} foreground={fg_count}"));
                     let prepare_patch_profile = crate::profile::span(&model.device, || format!("patch/prepare size={size}"));
                     let (images, n_opt) = match &full_device_images {
@@ -600,10 +600,11 @@ fn process_view(model: &Model, input: &Input, options: ProcessOptions) -> Result
                             (patch, None)
                         }
                         None => {
-                            let ImageLevel::Host(images) = &active else { unreachable!() };
+                            let images = active.as_ref().expect("Host images exist when full_device_images is None");
+                            let prior_ref = prior_host.as_ref().expect("Host prior exists when full_device_images is None");
                             let patches: Vec<_> = images.par_iter().map(|r| r.crop(y, x, 256, 256)).collect();
                             let imgs = upload_images(model, &patches);
-                            let n = prior.clone().slice([0..1, 0..3, y..y + 256, x..x + 256]);
+                            let n = prior_ref.clone().slice([0..1, 0..3, y..y + 256, x..x + 256]);
                             (imgs, Some(n))
                         }
                     };
@@ -613,6 +614,7 @@ fn process_view(model: &Model, input: &Input, options: ProcessOptions) -> Result
                     let patch_mask = mask.clone().slice([0..1, 0..1, y..y + 256, x..x + 256])
                         .bool_or(interiors[row * 3 + col].clone());
                     drop(prepare_patch_profile);
+                    if let Some(ref mut trace)=patch_trace { trace.mark("prepare"); }
                     // At the final scale, only `patch_host_mask` pixels survive `final_mask`, so
                     // `pool_block` only needs the U-Net decoder dependency cone of `patch_host_mask`.
                     // At intermediate patch scales, the 192x192 interior is kept for the next scale's prior.
@@ -621,20 +623,34 @@ fn process_view(model: &Model, input: &Input, options: ProcessOptions) -> Result
                     } else {
                         None
                     };
-                    let prediction = stage_device(model, images, n_opt, patch_mask, host_mask_slice)?;
-                    let blend_profile = crate::profile::span(&model.device, || format!("patch/blend size={size}"));
-                    let weighted = prediction * gaussian.as_ref().unwrap().clone();
-                    let region = [0..1, 0..3, y..y + 256, x..x + 256];
-                    let updated = out.clone().slice(region.clone()) + weighted;
-                    out = out.slice_assign(region, updated);
-                    drop(blend_profile);
-                    // Submit outstanding fusion work and bound pool reservation without per-chunk stalls.
-                    model.device.flush().map_err(|e| anyhow::anyhow!("GPU submission failed: {e:?}"))?;
+                    out = crate::trace::gpu_window(&model.device,size,y,x,|| -> Result<Tensor<4>> {
+                        let prediction = stage_device(model, images, n_opt, patch_mask, host_mask_slice)?;
+                        if let Some(ref mut trace)=patch_trace { trace.mark("network_submit"); }
+                        let blend_profile = crate::profile::span(&model.device, || format!("patch/blend size={size}"));
+                        let weighted = prediction * gaussian.as_ref().unwrap().clone();
+                        let region = [0..1, 0..3, y..y + 256, x..x + 256];
+                        let updated = out.clone().slice(region.clone()) + weighted;
+                        let blended = out.slice_assign(region, updated);
+                        drop(blend_profile);
+                        if let Some(ref mut trace)=patch_trace { trace.mark("blend_submit"); }
+                        // Preserve the existing flush before the patch completion wait.
+                        model.device.flush().map_err(|e| anyhow::anyhow!("GPU submission failed: {e:?}"))?;
+                        if let Some(ref mut trace)=patch_trace { trace.mark("final_flush"); }
+                        Ok(blended)
+                    }).map_err(|e|anyhow::anyhow!("Patch device timing failed: {e:?}"))??;
+                    if crate::trace::gpu_enabled() {
+                        if let Some(ref mut trace)=patch_trace { trace.mark("gpu_window_close"); }
+                    }
                     submitted += 1;
                     crate::execution::checkpoint_patch(&model.device, submitted);
+                    crate::execution::trim_memory(&model.device);
+                    if let Some(mut trace)=patch_trace { trace.mark("completion_wait");trace.finish(&model.device,submitted); }
                     eprintln!("  Patch {count}/{total} {}", if crate::execution::depth() != 0 || crate::profile::enabled() { "completed" } else { "queued" });
                 }
             }
+            drop(full_device_images);
+            drop(prior_host);
+            drop(active);
             crate::execution::checkpoint_patch(&model.device, submitted);
             crate::execution::trim_memory(&model.device);
             out
@@ -645,6 +661,7 @@ fn process_view(model: &Model, input: &Input, options: ProcessOptions) -> Result
     let normal = crate::model::normalize(normal.context("Empty image pyramid")?)
         .mask_fill(final_mask.context("Missing final mask")?.bool_not(), 0.);
     let data = read_tensor(normal);
+    crate::execution::cleanup_view(&model.device);
     Ok(Raster { c: 3, h: input.size, w: input.size, data })
 }
 #[derive(Clone, Copy, Debug)]

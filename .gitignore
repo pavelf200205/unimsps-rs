@@ -2,6 +2,7 @@
 /dist/
 /runs/
 /experiments/
+/experiments_old/
 /weights/
 __pycache__/
 *.pyc

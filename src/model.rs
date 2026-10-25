@@ -177,9 +177,9 @@ impl Model {
             .filter_map(|k| k.strip_suffix(".dec.0.S").map(str::to_owned))
             .collect();
         for prefix in seed_keys {
-            let (_, s_vals) = &raw_f32[&format!("{prefix}.dec.0.S")];
-            let (w_shape, w_vals) = &raw_f32[&format!("{prefix}.dec.0.mab.fc_q.weight")];
-            let (_, b_vals) = &raw_f32[&format!("{prefix}.dec.0.mab.fc_q.bias")];
+            let (_, s_vals) = raw_f32.remove(&format!("{prefix}.dec.0.S")).unwrap();
+            let (w_shape, w_vals) = raw_f32.remove(&format!("{prefix}.dec.0.mab.fc_q.weight")).unwrap();
+            let (_, b_vals) = raw_f32.remove(&format!("{prefix}.dec.0.mab.fc_q.bias")).unwrap();
             let (in_c, out_c) = (w_shape[0], w_shape[1]);
             let mut q_seed = vec![0f32; out_c];
             for col in 0..out_c {
@@ -223,8 +223,8 @@ impl Model {
             .filter(|prefix| !raw_f32.contains_key(&format!("{prefix}.attn.sr.weight")))
             .collect();
         for prefix in sr1_prefixes {
-            let (q_shape, q_w) = &raw_f32[&format!("{prefix}.attn.q.weight")];
-            let (_, kv_w) = &raw_f32[&format!("{prefix}.attn.kv.weight")];
+            let (q_shape, q_w) = raw_f32.remove(&format!("{prefix}.attn.q.weight")).unwrap();
+            let (_, kv_w) = raw_f32.remove(&format!("{prefix}.attn.kv.weight")).unwrap();
             let c = q_shape[0];
             let mut qkv_w = vec![0f32; c * 3 * c];
             for r in 0..c {
@@ -626,18 +626,14 @@ impl Model {
     /// set-transformer GEMMs, and decoder up-blocks) for both Net_first and Net_stage.
     pub fn warmup(&self, lights: usize) -> Result<()> {
         let lights = lights.max(1);
-        let started = std::time::Instant::now();
-        let progress = |stage: &str| eprintln!("  Preparation: {stage} ({:.1}s elapsed)", started.elapsed().as_secs_f64());
 
         // 1. Warm Net_first (32x32 global coarse stage)
-        progress("32px network; cold compilation and tuning can take time");
         let dummy_first = Tensor::zeros([lights, 3, 32, 32], self.tensor_options());
         let mask32 = vec![true; 32 * 32];
         let _ = self.forward_masked(dummy_first, false, Some(&mask32))?;
 
         // 2. Warm intermediate scales (64x64, 128x128)
         for &sz in &[64, 128] {
-            progress(&format!("{sz}px network"));
             let dummy = Tensor::zeros([lights, 6, sz, sz], self.tensor_options());
             let mask = vec![true; sz * sz];
             let _ = self.forward_masked(dummy, true, Some(&mask))?;
@@ -645,7 +641,6 @@ impl Model {
 
         // 3. Warm Net_stage (256x256 patch refinement stage)
         // A representative mask; individual sparse bucket paths are warmed explicitly below.
-        progress("256px masked network");
         let dummy_stage = Tensor::zeros([lights, 6, 256, 256], self.tensor_options());
         let mut mask256 = vec![false; 256 * 256];
         for y in 32..224 {
@@ -656,13 +651,11 @@ impl Model {
         let _ = self.forward_masked(dummy_stage.clone(), true, Some(&mask256))?;
 
         // 4. Warm dense Net_stage (full 256x256 patch without masking)
-        progress("256px dense network");
         let _ = self.forward_masked(dummy_stage, true, None)?;
 
         // Exercise every sparse pool bucket before any timed view. The zero
         // input is shape-only during compile-only replay; light networks stay dense.
         for stage in 0..4 {
-            progress(&format!("sparse pool stage {}", stage + 1));
             let channels = [64,128,256,512][stage];
             let spatial = [65536,16384,4096,1024][stage];
             for &bucket in &[256,512,1024,2048,4096,8192,16384,32768] {
@@ -679,9 +672,8 @@ impl Model {
             }
         }
 
-        // 5. Ensure all pipeline shader compilations and autotunings complete
-        progress("waiting for outstanding GPU work");
-        self.device.sync().map_err(|e|anyhow::anyhow!("Warmup GPU completion failed: {e:?}"))?;
+        // 5. Ensure all pipeline shader compilations and autotunings complete and release warmup buffers
+        crate::execution::cleanup_view(&self.device);
         Ok(())
     }
 
@@ -713,10 +705,12 @@ impl Model {
         let mut current_mask: Option<Vec<bool>> = host_mask.map(|m| m.to_vec());
         let mut pools = Vec::new();
         let mut deepest = None;
+        let mut images_opt = Some(images);
         for i in 0..4 {
-            let _profile = crate::profile::span(&self.device, || format!("encoder-stage/{root}/{} input={:?}", i + 1, images.dims()));
+            let stage_images = images_opt.take().expect("stage input tensor present");
+            let [_, ic, ih, iw] = stage_images.dims();
+            let _profile = crate::profile::span(&self.device, || format!("encoder-stage/{root}/{} input={:?}", i + 1, [lights, ic, ih, iw]));
             let p = format!("{root}.patch_embed{}", i + 1);
-            let [_, ic, ih, iw] = images.dims();
             let c = [64, 128, 256, 512][i];
             let oh = if i == 0 { ih } else { ih / 2 };
             let ow = if i == 0 { iw } else { iw / 2 };
@@ -797,14 +791,18 @@ impl Model {
             });
 
             drop(mask_profile);
+            let mut stage_images_opt = Some(stage_images);
             let mut encoded_chunks = Vec::with_capacity((lights + self.options.encoder_batch - 1) / self.options.encoder_batch);
             for light in (0..lights).step_by(self.options.encoder_batch) {
                 let end = (light + self.options.encoder_batch).min(lights);
+                let _trace_batch = crate::trace::detail(||format!("encoder/stage={} lights={light}..{end}",i+1));
                 let batch = end - light;
                 let input_batch = if light == 0 && end == lights {
-                    images.clone()
+                    stage_images_opt.take().unwrap()
+                } else if end == lights {
+                    stage_images_opt.take().unwrap().slice([light..end, 0..ic, 0..ih, 0..iw])
                 } else {
-                    images.clone().slice([light..end, 0..ic, 0..ih, 0..iw])
+                    stage_images_opt.as_ref().unwrap().clone().slice([light..end, 0..ic, 0..ih, 0..iw])
                 };
                 let (z, hh, ww) = if i > 0 {
                     let tokens = input_batch.reshape([batch, ic, ih * iw]).swap_dims(1, 2);
@@ -835,6 +833,7 @@ impl Model {
                 Tensor::cat(encoded_chunks, 0)
             };
             let gather_profile = crate::profile::span(&self.device, || format!("layout/foreground-gather stage={}", i + 1));
+            let trace_pool = crate::trace::detail(||format!("pool/stage={}",i+1));
             let x = encoded.permute([1, 0, 2]);
             // `pool_block` outputs only enter the local convolutional U-Net decoder, so gathering
             // the exact decoder backward cone `active_mask` is 100% lossless (0.0 error on kept pixels).
@@ -849,19 +848,23 @@ impl Model {
                 .set_layer_pre_gathered(x_pool, &format!("{root}.pool_block{}", i + 1), true, active_mask.as_ref(), oh * ow)
                 .reshape([1, oh, ow, c])
                 .permute([0, 3, 1, 2]);
+            drop(trace_pool);
             if i < 3 {
+                let _trace_light = crate::trace::detail(||format!("light-transformer/stage={}",i+1));
                 // `light_block` feeds into subsequent encoder stages (`block2`, `block3`, `block4`)
                 // which perform global spatial self-attention over all spatial tokens in the patch.
-                images = self
-                    .set_layer(x, &format!("{root}.light_block{}", i + 1), false)
-                    .permute([1, 2, 0])
-                    .reshape([lights, c, oh, ow]);
+                images_opt = Some(
+                    self.set_layer(x, &format!("{root}.light_block{}", i + 1), false)
+                        .permute([1, 2, 0])
+                        .reshape([lights, c, oh, ow]),
+                );
                 pools.push(pool);
             } else {
                 deepest = Some(pool);
             }
         }
         let mut x = deepest.unwrap();
+        let _trace_decoder = crate::trace::detail(||"decoder".into());
         let _decoder_profile = crate::profile::span(&self.device, || format!("decoder/{root} input={:?}", x.dims()));
         for i in 0..3 {
             let _profile = crate::profile::span(&self.device, || format!("decoder/up{} input={:?}", i + 1, x.dims()));

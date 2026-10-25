@@ -79,21 +79,3 @@ Specific code paths to distinguish:
 Added opt-in --trace-gpu to distinguish device elapsed windows, final submission,
 completion waits and CPU stage submission. No algorithm, batching or allocator
 policy change is claimed as a fix. Source-reviewed only; the user runs builds.
-
-## Device-timestamp results: traces 10, 11 and 12
-
-Trace 10 uses six images and device timing. It has real stalls: view 07 takes 5.82 s, view 08 11.80 s, view 09 30.30 s; view 10 recovers to 15.27 s.
-Trace 11 uses nine images and device timing. Views 00/01 take 37.13/66.77 s. Sum of patch device windows is 35.91/62.61 s respectively.
-Trace 12 has nine-image metadata for views 00/01 at 39.76/55.38 s, but no timing_trace.json files. It establishes slow unprofiled execution, not a breakdown of its cause.
-
-Decisive examples:
-- Trace 10, view 07, scale 512, x=128 y=256: wall 1404.14 ms; device 1400.26 ms; network submission 33.80 ms; final flush 1.19 ms; completion wait 1368.92 ms.
-- Trace 11, view 01, scale 512, x=128 y=0: wall 3134.47 ms; device 3128.69 ms. At x=0 y=128 in the same scale/view: wall 598.97 ms; device 596.18 ms.
-
-The slow six-image example has finished submitting almost all patch work in about 35 ms, while the GPU timestamp interval lasts about 1.4 s. A delayed CPU completion callback alone cannot account for that interval. Most slow patches have device elapsed time within roughly 1% of total patch wall time. First patches can include earlier coarse-scale work outside their device window and must not be used to calculate callback delay by subtraction.
-
-CPU stage stalls migrate across encoder stages and light-transformer submission, consistent with runtime backpressure charging earlier GPU work to the currently issuing stage. These labels do not identify a slow GPU kernel. Device windows include gaps/preemption and are not kernel-busy-time sums.
-
-Nine-image 8+1 batching adds submission work, but is neither a necessary cause (six-image stalls exist) nor a sufficient explanation of intermittent 5x changes. Timestamp instrumentation is not required to reproduce the slowdown (trace 12). GPU clocks/power were not recorded; reported normal temperatures do not establish stable clocks. No specific faulty kernel has yet been demonstrated.
-
-No source changes, compilation, or inference were performed for this analysis.

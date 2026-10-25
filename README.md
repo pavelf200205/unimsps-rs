@@ -2,8 +2,8 @@
 
 Standalone uncalibrated inference port of Uni-MS-PS Turbo, upstream revision
 `903abb24a8db3608026d13d204258721c9654ae9`.
-Burn is pinned to **0.22.1**, with CubeCL **0.11.3** and CubeK **0.3.1**.
-There are no runtime or source dependencies on the separate SuperNormal project.
+Burn is pinned to **0.22.0**, matching the version used by the separate SuperNormal
+project. There are no runtime or source dependencies on SuperNormal.
 
 The primary goal is fast inference across GPU manufacturers through WGPU
 (Vulkan, DirectX 12 or Metal, depending on the platform). CUDA is optional;
@@ -191,11 +191,9 @@ requirements automatically retain that implementation. Latest source changes
 have not been compiled or timed here. FP32 reductions may change FP16 rounding.
 
 `--pool-cache-mib N` controls the allocator reservation threshold that triggers
-cleanup. The default is 1024 MiB of unused reservation. Larger values can retain
+cleanup. The existing 1536 MiB default is unchanged. Larger values can retain
 more reusable buffers at the cost of higher reserved VRAM; 0 disables these
 explicit cleanup calls. This is a cleanup trigger, not a hard VRAM limit.
-The check also runs after view-local tensors have dropped. `--view-cleanup always`
-instead purges unused buffers after every view, at the cost of allocation reuse.
 
 Verbose profiling now separates QK GEMM, softmax and AV GEMM, records softmax
 in-place reuse, and measures allocator check/cleanup time. The saved native-GEMM profile in experiments/unimsps_run11 combines both GEMMs

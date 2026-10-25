@@ -3,17 +3,24 @@ use burn::tensor::{Device, DeviceKind, FloatDType};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use unimsps::{
-    cache::{CacheMode, default_cache_dir, init_environment, configure_runtime, build_id, checkpoint_and_report},
+    cache::{default_cache_dir, init_environment, configure_runtime, build_id, checkpoint_and_report},
     model::{Model, ModelOptions, read_tensor, tensor},
     pipeline::{Input, ProcessOptions, SaveFormats, process_with_options, save_with_formats},
 };
 
 #[derive(Parser)]
-#[command(about = "Uni-MS-PS normal estimation using Burn 0.22.1")]
+#[command(about = "Uni-MS-PS normal estimation using Burn 0.22")]
 struct Cli {
     /// Detailed synchronized CPU/GPU wall timings; writes profile.json. Slows execution.
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
+    /// Lightweight patch wall-time and pool trace; adds no GPU waits and writes timing_trace.json.
+    #[arg(long, global = true)]
+    trace_performance: bool,
+    /// Trace patch device timestamps and CPU stage submission times; implies --trace-performance.
+    /// Changes command boundaries; use without --verbose to investigate stalls.
+    #[arg(long, global = true, conflicts_with = "verbose")]
+    trace_gpu: bool,
     /// Maximum complete patches between GPU waits; inner chunks submit asynchronously; 0 is unbounded.
     #[arg(long, default_value_t = 1, global = true)]
     queue_depth: usize,
@@ -56,9 +63,6 @@ struct Cli {
     /// Unused allocator cache threshold at scale boundaries; 0 disables trimming (default: 1024 MiB).
     #[arg(long, default_value_t = 1024, global = true)]
     pool_cache_mib: usize,
-    /// End-of-view reclaim: threshold keeps reusable buffers; always purges unused buffers.
-    #[arg(long, default_value = "threshold", value_parser = ["threshold", "always"], global = true)]
-    view_cleanup: String,
     /// Force custom subgroup fused spatial attention instead of standard hardware GEMM.
     #[arg(long, global = true)]
     fused_attention: bool,
@@ -74,10 +78,7 @@ struct Cli {
     /// Directory for persistent compiled kernels, autotune choices, and workload metadata.
     #[arg(long, visible_aliases = ["cache-dir", "cache_dir"], global = true)]
     kernel_cache_dir: Option<PathBuf>,
-    /// Persist shaders only (default), all runtime caches, or use process memory only.
-    #[arg(long, value_enum, default_value = "shaders", global = true)]
-    cache_mode: CacheMode,
-    /// Use process-local caching only; equivalent to --cache-mode memory.
+    /// Disable persistent GPU kernel caching across runs.
     #[arg(long, global = true)]
     no_kernel_cache: bool,
     #[command(subcommand)]
@@ -114,17 +115,16 @@ enum Command {
 fn main() -> Result<()> {
     let program_start = std::time::Instant::now();
     let cli = Cli::parse();
-    eprintln!("unimsps (Burn 0.22.1 / CubeCL 0.11.3 / CubeK 0.3.1)");
+    eprintln!("unimsps 0.1.2 (WGPU/CUDA native GEMM + persistent kernel cache build)");
     unimsps::profile::configure(cli.verbose);
+    unimsps::trace::configure(cli.trace_performance);
+    unimsps::trace::configure_gpu(cli.trace_gpu);
     unimsps::execution::configure(cli.queue_depth);
     unimsps::execution::configure_pool_cache(cli.pool_cache_mib);
-    unimsps::execution::configure_view_cleanup(cli.view_cleanup == "always");
 
     let cache_dir = cli.kernel_cache_dir.clone().unwrap_or_else(default_cache_dir);
-    let cache_mode = if cli.no_kernel_cache || cli.cpu { CacheMode::Memory } else { cli.cache_mode };
-    let persistent_cache = cache_mode.persistent();
-    configure_runtime(&cache_dir, cache_mode);
-    let mut kernel_cache = if persistent_cache {
+    configure_runtime(&cache_dir, !cli.no_kernel_cache && !cli.cpu);
+    let mut kernel_cache = if !cli.no_kernel_cache && !cli.cpu {
         init_environment(&cache_dir, cli.kernel_cache_dir.is_some())
     } else {
         Default::default()
@@ -179,14 +179,14 @@ fn main() -> Result<()> {
     };
     eprintln!("Device: {:?} (api: {effective_api})", device.identity());
     eprintln!("Queue depth: {} (0 = asynchronous flush)", cli.queue_depth);
-    if persistent_cache {
+    if !cli.no_kernel_cache && !cli.cpu {
         eprintln!("Kernel cache: {}", cache_dir.display());
     }
 
     match cli.command {
         Command::Doctor => {
             let x = tensor(vec![1., 2., 3., 4.], [2, 2], &device);
-            println!("Burn 0.22.1 matmul: {:?}", read_tensor(x.clone().matmul(x)));
+            println!("Burn 0.22 matmul: {:?}", read_tensor(x.clone().matmul(x)));
         }
         Command::Infer {
             model,
@@ -266,30 +266,22 @@ fn main() -> Result<()> {
                 net.options.pixel_batch,warmup_lights,net.options.query_batch,net.options.score_budget_mib,
                 net.options.fused_attention,net.options.fused_softmax,net.options.optimized_encoder,net.options.gemm_convolutions,
             );
-            let preparation_start = std::time::Instant::now();
             if !cli.no_warmup && !cli.cpu {
-                if persistent_cache && kernel_cache.is_warmed(&cache_signature) {
-                    eprintln!("Previously warmed workload: replaying process-local setup from persistent artifacts.");
+                if !cli.no_kernel_cache && kernel_cache.is_warmed(&cache_signature) {
+                    eprintln!(
+                        "Using persisted CubeCL autotune & shader cache for {warmup_lights} lights (skipping redundant 36-pass warmup replay)."
+                    );
                 } else {
-                    eprintln!("Preparing kernels and tuning for {warmup_lights} lights (first use may be slow)...");
-                }
-                let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/compile-only-replay".into());
-                {
-                    // Shape-driven forward passes only. No output is read or used.
-                    // Autotune measurements still execute when a strategy is missing.
-                    let _compile_only = cubecl::dry_run::DryRun::new();
+                    eprintln!("Warming kernels and autotuning for {warmup_lights} lights (first use may be slow)...");
+                    let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/compile-and-autotune".into());
                     net.warmup(warmup_lights)?;
+                    drop(warmup_profile);
+                    if !cli.no_kernel_cache {
+                        kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
+                    }
+                    eprintln!("Kernel warmup complete; normal inference executes on the GPU.");
                 }
-                // Drain all lazy fusion work before leaving compile-only mode (warmup syncs).
-                drop(warmup_profile);
-                if persistent_cache {
-                    kernel_cache.record_and_save(&cache_dir,Some(cache_signature.clone()));
-                    checkpoint_and_report("after preparation");
-                }
-                eprintln!("Kernel preparation complete; normal inference executes on the GPU.");
             }
-            let preparation_seconds = preparation_start.elapsed().as_secs_f64();
-            eprintln!("Preparation: {preparation_seconds:.2}s; end-of-view cleanup: {}", cli.view_cleanup);
             for (obj_idx, object) in objects.into_iter().enumerate() {
                 let out = if batch {
                     out.join(
@@ -300,6 +292,7 @@ fn main() -> Result<()> {
                 } else {
                     out.clone()
                 };
+                unimsps::trace::begin_view();
                 let input_profile = unimsps::profile::phase(&net.device, || "input/decode-crop-normalize".into());
                 let input = Input::load(&object, image_limit)?;
                 drop(input_profile);
@@ -320,37 +313,26 @@ fn main() -> Result<()> {
                 let save_profile = unimsps::profile::phase(&net.device, || "output/encode-and-save".into());
                 save_with_formats(&normal, &out, save_formats)?;
                 drop(save_profile);
-                if obj_idx == 0 && persistent_cache {
+                if obj_idx == 0 && !cli.no_kernel_cache && !cli.cpu {
                     kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
                 }
-                let view_seconds = start.elapsed().as_secs_f64();
-                let memory_after_view = unimsps::execution::memory_snapshot(&net.device);
                 std::fs::write(
                     out.join("metadata.json"),
                     serde_json::to_vec_pretty(
-                        &serde_json::json!({
-                            "width":normal.w,"height":normal.h,"formats":save_formats.names(),
-                            "normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip",
-                            "input_channels":"BGR","files":input.files,"model":model,"seconds":view_seconds,
-                            "precision":format!("{dtype:?}"),"api":effective_api,
-                            "encoder_batch":cli.encoder_batch,"pixel_batch":net.options.pixel_batch,
-                            "queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,
-                            "score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,
-                            "optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,
-                            "pool_cache_mib":cli.pool_cache_mib,"view_cleanup":cli.view_cleanup,
-                            "memory_after_view":memory_after_view,"cache_mode":cache_mode.name(),
-                            "cache_build_id":build_id(),"preparation_seconds":preparation_seconds,
-                            "images":input.images.len(),"padded_size":input.size,
-                            "burn":"0.22.1","cubecl":"0.11.3","cubek":"0.3.1",
-                            "crop_policy":"upstream exclusive maxima"
-                        }),
+                        &serde_json::json!({"width":normal.w,"height":normal.h,"formats":save_formats.names(),"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"api":effective_api,"encoder_batch":cli.encoder_batch,"pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,"optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,"pool_cache_mib":cli.pool_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
                     )?,
                 )?;
                 println!(
                     "Saved normals to {} ({:.2}s)",
                     out.display(),
-                    view_seconds
+                    start.elapsed().as_secs_f64()
                 );
+                unimsps::trace::write_report(&out.join("timing_trace.json"),serde_json::json!({
+                    "images":input.images.len(),"padded_size":input.size,"queue_depth":cli.queue_depth,
+                    "score_budget_mib":cli.score_budget_mib,"pool_cache_mib":cli.pool_cache_mib,
+                    "encoder_batch":cli.encoder_batch,"precision":format!("{dtype:?}"),"api":effective_api,
+                    "kernel_cache_dir":cache_dir,"persistent_cache_enabled":!cli.no_kernel_cache && !cli.cpu,
+                    "device":format!("{:?}",net.device.identity())}))?;
                 unimsps::profile::write_report(&out.join("profile.json"), serde_json::json!({
                     "device": format!("{:?}", net.device.identity()), "api": effective_api,
                     "precision": format!("{dtype:?}"), "images": input.images.len(),
@@ -416,7 +398,7 @@ fn main() -> Result<()> {
             );
         }
     }
-    if persistent_cache { checkpoint_and_report("exit"); }
+    if !cli.no_kernel_cache && !cli.cpu { checkpoint_and_report("exit"); }
     let total_secs = program_start.elapsed().as_secs_f64();
     eprintln!("Total run time: {total_secs:.2}s");
     println!("Total run time: {total_secs:.2}s");

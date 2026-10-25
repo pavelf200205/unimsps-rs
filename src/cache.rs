@@ -11,15 +11,6 @@ pub struct KernelCache {
 }
 const CACHE_VERSION: u32 = 3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum CacheMode { Shaders, Full, Memory }
-impl CacheMode {
-    pub fn persistent(self) -> bool { self != Self::Memory }
-    pub fn name(self) -> &'static str {
-        match self { Self::Shaders => "shaders", Self::Full => "full", Self::Memory => "memory" }
-    }
-}
-
 pub fn default_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("UNIMSPS_CACHE_DIR") {
         if !dir.trim().is_empty() { return PathBuf::from(dir); }
@@ -28,35 +19,62 @@ pub fn default_cache_dir() -> PathBuf {
         .unwrap_or_else(||PathBuf::from(".")).join(".unimsps-kernels")
 }
 
-/// Source/dependency/toolchain identity emitted by build.rs. Renaming or copying
-/// an executable does not invalidate its cache.
+/// A rebuilt executable gets a fresh environment; repeated launches reuse it.
 pub fn build_id() -> &'static str {
-    env!("UNIMSPS_CACHE_BUILD_ID")
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let metadata = std::env::current_exe().ok().and_then(|p|std::fs::metadata(p).ok());
+        let size = metadata.as_ref().map_or(0,|m|m.len());
+        let time = metadata.and_then(|m|m.modified().ok())
+            .and_then(|t|t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0,|d|d.as_nanos());
+        format!("v{CACHE_VERSION}-{size:x}-{time:x}")
+    })
 }
 
 /// Must run before any device/configuration is initialized. The runtime store
 /// persists SPIR-V and autotune choices; a manifest alone never skips replay.
-pub fn configure_runtime(cache_dir: &Path, mode: CacheMode) {
+fn set_env_if_absent<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, val: V) {
+    if std::env::var_os(key.as_ref()).is_none() {
+        unsafe {
+            std::env::set_var(key, val);
+        }
+    }
+}
+
+pub fn configure_runtime(cache_dir: &Path, enabled: bool) {
     install_warning_logger();
-    use cubecl_environment::persistence::{set_persistence_policy, PersistencePolicy};
-    set_persistence_policy(match mode {
-        CacheMode::Shaders => PersistencePolicy::Shaders,
-        CacheMode::Full => PersistencePolicy::All,
-        CacheMode::Memory => PersistencePolicy::Memory,
-    });
+    if enabled {
+        let driver_gl_dir = cache_dir.join("nvidia_gl_cache");
+        let driver_cuda_dir = cache_dir.join("nvidia_compute_cache");
+        let driver_mesa_dir = cache_dir.join("mesa_shader_cache");
+        let _ = std::fs::create_dir_all(&driver_gl_dir);
+        let _ = std::fs::create_dir_all(&driver_cuda_dir);
+        let _ = std::fs::create_dir_all(&driver_mesa_dir);
+
+        // Configure 2 GiB driver shader cache quotas and disable automatic cleanup
+        // so compiled Vulkan / CUDA / Mesa pipelines are not evicted between runs.
+        set_env_if_absent("__GL_SHADER_DISK_CACHE", "1");
+        set_env_if_absent("__GL_SHADER_DISK_CACHE_PATH", &driver_gl_dir);
+        set_env_if_absent("__GL_SHADER_DISK_CACHE_SIZE", "2147483648");
+        set_env_if_absent("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1");
+
+        set_env_if_absent("CUDA_CACHE_DISABLE", "0");
+        set_env_if_absent("CUDA_CACHE_PATH", &driver_cuda_dir);
+        set_env_if_absent("CUDA_CACHE_MAXSIZE", "2147483648");
+
+        set_env_if_absent("MESA_SHADER_CACHE_DIR", &driver_mesa_dir);
+        set_env_if_absent("MESA_SHADER_CACHE_MAX_SIZE", "2G");
+    }
     let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
-    // Keep process-local reuse in every mode; route persistence at Storage.
-    // Disabling throughput caching also disables RAM reuse and repeats probes.
-    config.compilation.cache = true;
-    config.autotune.disable_cache = false;
-    config.throughput.disable_cache = false;
+    config.compilation.cache = enabled;
+    config.autotune.disable_cache = !enabled;
+    config.throughput.disable_cache = !enabled;
     config.environment.path = CacheConfig::Directory(cache_dir.join("runtime"));
     config.environment.name = format!("unimsps-{}",build_id());
     if !CubeClRuntimeConfig::try_set(config) {
         eprintln!("Runtime configuration was already initialized; cache settings could not be applied.");
     }
-    eprintln!("Cache mode: {}; build: {}",mode.name(),build_id());
-    if mode.persistent() {
+    if enabled {
         eprintln!("Persistent CubeCL store: {} (environment unimsps-{})",cache_dir.join("runtime").display(),build_id());
         probe_database();
     }
@@ -66,12 +84,11 @@ pub fn init_environment(cache_dir: &Path, _explicit_custom_dir: bool) -> KernelC
     if let Err(error) = std::fs::create_dir_all(cache_dir) {
         eprintln!("Cannot create cache directory {}: {error}",cache_dir.display());
     }
-    let cache = std::fs::read(cache_dir.join(format!("kernel-state-{}.json",build_id()))).ok()
+    let cache = std::fs::read(cache_dir.join("kernel_state.json")).ok()
         .and_then(|b|serde_json::from_slice::<KernelCache>(&b).ok())
         .filter(|c|c.version==CACHE_VERSION)
         .unwrap_or_else(||KernelCache { version:CACHE_VERSION,..Default::default() });
-    // Flash availability depends on the device/runtime. Rediscover it in each
-    // process instead of loading another adapter's shape-only negative cache.
+    crate::attention::load_unavailable(cache.unavailable_flash_shapes.iter().cloned());
     cache
 }
 impl KernelCache {
@@ -84,7 +101,7 @@ impl KernelCache {
         let saved = (|| -> Result<(),Box<dyn std::error::Error>> {
             std::fs::create_dir_all(cache_dir)?;
             // Runtime artifacts live in the CubeCL database; this file only records workloads.
-            std::fs::write(cache_dir.join(format!("kernel-state-{}.json",build_id())),serde_json::to_vec_pretty(self)?)?;
+            std::fs::write(cache_dir.join("kernel_state.json"),serde_json::to_vec_pretty(self)?)?;
             Ok(())
         })();
         if let Err(error)=saved { eprintln!("Could not save warmup metadata: {error}"); }
