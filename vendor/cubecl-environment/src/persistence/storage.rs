@@ -7,6 +7,23 @@ use hashbrown::HashMap;
 use crate::bytes::Bytes;
 use crate::sync::{Arc, LazyLock, Mutex};
 
+/// Application storage policy; configure before opening any stores or devices.
+/// Changing it later does not migrate existing stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PersistencePolicy { All = 0, Memory = 1, Shaders = 2 }
+static PERSISTENCE_POLICY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+pub fn set_persistence_policy(policy: PersistencePolicy) {
+    PERSISTENCE_POLICY.store(policy as u8, core::sync::atomic::Ordering::Relaxed);
+}
+pub fn persistence_policy() -> PersistencePolicy {
+    match PERSISTENCE_POLICY.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => PersistencePolicy::Memory,
+        2 => PersistencePolicy::Shaders,
+        _ => PersistencePolicy::All,
+    }
+}
+
 /// Where an entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -334,6 +351,7 @@ pub struct NamespaceSummary {
 /// Empty without a durable backend: memory namespaces do not outlive the
 /// process that wrote them.
 pub fn namespaces() -> Vec<String> {
+    if persistence_policy() != PersistencePolicy::All { return Vec::new(); }
     cfg_if::cfg_if! {
         if #[cfg(any(native_cache, browser_cache))] {
             super::turso::summary()
@@ -353,6 +371,12 @@ pub fn namespaces() -> Vec<String> {
 /// can't be opened somewhere else without making "a single active
 /// environment" false. See [`crate::environment`].
 pub fn open(namespace: &str) -> Box<dyn Storage> {
+    let durable = match persistence_policy() {
+        PersistencePolicy::All => true,
+        PersistencePolicy::Memory => false,
+        PersistencePolicy::Shaders => namespace.starts_with("vulkan/") || namespace.starts_with("cuda/"),
+    };
+    if !durable { return Box::new(MemoryStorage::in_environment(namespace)); }
     cfg_if::cfg_if! {
         if #[cfg(any(native_cache, browser_cache))] {
             match super::turso::open(namespace) {

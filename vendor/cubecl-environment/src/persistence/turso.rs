@@ -158,6 +158,9 @@ impl core::fmt::Debug for Database {
 impl Database {
     /// A connection to the active environment's database.
     fn open() -> Result<Self, String> {
+        if super::persistence_policy() == super::PersistencePolicy::Memory {
+            return Err("database disabled by memory-only cache policy".into());
+        }
         let location = location()?;
         let database = database()?;
         let connection = connect(&database).map_err(error)?;
@@ -174,6 +177,9 @@ impl Database {
     /// hasn't awaited [`crate::environment::open`]. Callers go without
     /// rather than fail.
     pub fn open_active() -> Option<Self> {
+        // Record sessions bypass Storage; avoid their database I/O in shader
+        // and memory modes as well.
+        if super::persistence_policy() != super::PersistencePolicy::All { return None; }
         match Self::open() {
             Ok(database) => Some(database),
             Err(error) => {
@@ -200,6 +206,9 @@ impl Database {
     /// build's schema.
     #[cfg(native_cache)]
     pub fn open_at(path: &std::path::Path, access: Access) -> Result<Self, String> {
+        if super::persistence_policy() == super::PersistencePolicy::Memory {
+            return Err("database disabled by memory-only cache policy".into());
+        }
         let active = location()
             .ok()
             .filter(|active| same_file(path, std::path::Path::new(active)));
@@ -363,8 +372,7 @@ impl Database {
             .unwrap_or_default()
     }
 
-    /// Flush committed cache entries from the WAL into the main database file.
-    /// Does not change journal mode or close live cache connections.
+    /// Flush committed WAL entries without closing active runtime connections.
     #[cfg(native_cache)]
     pub fn checkpoint(&self) -> Result<bool, String> {
         checkpoint(&self.connection.lock()).map_err(error)
@@ -701,10 +709,9 @@ async fn open_database(location: &str) -> Result<turso::Database, turso::Error> 
             .map_err(|error| turso::Error::IoError(error.kind(), "creating the cache directory"))?;
     }
 
-    // Uni-MS-PS local patch: Turso's default WindowsIO has no shared-WAL
-    // coordination primitives. Use its normal locked database mode on Windows;
-    // leave supported Unix multiprocess WAL unchanged.
     turso::Builder::new_local(location)
+        // WindowsIO does not support shared-WAL coordination. Normal database
+        // locking still applies; concurrent processes need separate cache dirs.
         .experimental_multiprocess_wal(!cfg!(target_os = "windows"))
         .build()
         .await

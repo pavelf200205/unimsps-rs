@@ -1,15 +1,22 @@
 # Local persistence patch
 
-Upstream: cubecl-environment 0.11.0, MIT OR Apache-2.0.
+Upstream: cubecl-environment 0.11.3, MIT OR Apache-2.0.
 
-Changes in src/persistence/turso.rs:
-- Disable experimental multiprocess WAL on Windows only. Turso 0.8.3 default
-  WindowsIO does not implement shared-WAL coordination; the old open falls back
-  to process memory. The normal Windows file lock remains active. Concurrent
-  processes cannot share one writable cache; use separate --kernel-cache-dir
-  values when running multiple instances. Unix multiprocess WAL is unchanged.
-- Expose Database::checkpoint to fold committed WAL data into the main cache
-  database without changing journal mode or closing active runtime connections.
+Changes:
+- Disable experimental multiprocess WAL on Windows. Turso's default WindowsIO
+  lacks the required shared-WAL coordination. Normal file locks remain active;
+  concurrent Windows processes should use separate cache directories.
+- Expose Database::checkpoint for folding the WAL into the main database.
+- Add a startup-only PersistencePolicy at the Storage boundary: All preserves
+  upstream behavior; Memory routes every namespace to process-local storage;
+  Shaders persists only vulkan/ and cuda/ compiler namespaces. Tuning and
+  throughput stores still reuse their data in memory.
+- Disable direct runtime-record database opens and durable namespace enumeration
+  in Shaders/Memory modes. Memory also rejects explicit database opens. Shaders
+  permits explicit opens for the application's cache probe and reporting.
 
-This patch is scoped to unimsps-rs by Cargo's local patch section.
-No global Cargo registry files were modified.
+Configure the policy before opening any stores or initializing a device. Changing
+it later does not migrate existing stores. Compiler prefixes were checked against
+CubeCL 0.11.3; review them when updating CubeCL.
+
+Cargo's local patch scopes this to unimsps-rs. No global registry source was edited.

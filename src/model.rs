@@ -626,14 +626,18 @@ impl Model {
     /// set-transformer GEMMs, and decoder up-blocks) for both Net_first and Net_stage.
     pub fn warmup(&self, lights: usize) -> Result<()> {
         let lights = lights.max(1);
+        let started = std::time::Instant::now();
+        let progress = |stage: &str| eprintln!("  Preparation: {stage} ({:.1}s elapsed)", started.elapsed().as_secs_f64());
 
         // 1. Warm Net_first (32x32 global coarse stage)
+        progress("32px network; cold compilation and tuning can take time");
         let dummy_first = Tensor::zeros([lights, 3, 32, 32], self.tensor_options());
         let mask32 = vec![true; 32 * 32];
         let _ = self.forward_masked(dummy_first, false, Some(&mask32))?;
 
         // 2. Warm intermediate scales (64x64, 128x128)
         for &sz in &[64, 128] {
+            progress(&format!("{sz}px network"));
             let dummy = Tensor::zeros([lights, 6, sz, sz], self.tensor_options());
             let mask = vec![true; sz * sz];
             let _ = self.forward_masked(dummy, true, Some(&mask))?;
@@ -641,6 +645,7 @@ impl Model {
 
         // 3. Warm Net_stage (256x256 patch refinement stage)
         // A representative mask; individual sparse bucket paths are warmed explicitly below.
+        progress("256px masked network");
         let dummy_stage = Tensor::zeros([lights, 6, 256, 256], self.tensor_options());
         let mut mask256 = vec![false; 256 * 256];
         for y in 32..224 {
@@ -651,11 +656,13 @@ impl Model {
         let _ = self.forward_masked(dummy_stage.clone(), true, Some(&mask256))?;
 
         // 4. Warm dense Net_stage (full 256x256 patch without masking)
+        progress("256px dense network");
         let _ = self.forward_masked(dummy_stage, true, None)?;
 
         // Exercise every sparse pool bucket before any timed view. The zero
         // input is shape-only during compile-only replay; light networks stay dense.
         for stage in 0..4 {
+            progress(&format!("sparse pool stage {}", stage + 1));
             let channels = [64,128,256,512][stage];
             let spatial = [65536,16384,4096,1024][stage];
             for &bucket in &[256,512,1024,2048,4096,8192,16384,32768] {
@@ -673,6 +680,7 @@ impl Model {
         }
 
         // 5. Ensure all pipeline shader compilations and autotunings complete
+        progress("waiting for outstanding GPU work");
         self.device.sync().map_err(|e|anyhow::anyhow!("Warmup GPU completion failed: {e:?}"))?;
         Ok(())
     }

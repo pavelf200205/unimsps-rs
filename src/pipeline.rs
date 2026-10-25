@@ -450,6 +450,14 @@ pub fn process(model: &Model, input: &Input) -> Result<Raster> {
 }
 
 pub fn process_with_options(model: &Model, input: &Input, options: ProcessOptions) -> Result<Raster> {
+    // The inner scope owns all per-view GPU tensors. Reclaim only after they
+    // have dropped, including the cached boundary masks and Gaussian weights.
+    let result = process_view(model, input, options);
+    crate::execution::cleanup_view(&model.device);
+    result
+}
+
+fn process_view(model: &Model, input: &Input, options: ProcessOptions) -> Result<Raster> {
     use std::borrow::Cow;
     use rayon::prelude::*;
 
@@ -637,7 +645,6 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
     let normal = crate::model::normalize(normal.context("Empty image pyramid")?)
         .mask_fill(final_mask.context("Missing final mask")?.bool_not(), 0.);
     let data = read_tensor(normal);
-    crate::execution::cleanup_view(&model.device);
     Ok(Raster { c: 3, h: input.size, w: input.size, data })
 }
 #[derive(Clone, Copy, Debug)]
