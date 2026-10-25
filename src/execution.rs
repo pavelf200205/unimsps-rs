@@ -17,13 +17,10 @@ pub fn configure_pool_cache(mib: usize) {
     POOL_CACHE_BYTES.store(mib.saturating_mul(1024 * 1024), Ordering::Relaxed);
 }
 
-pub(crate) fn checkpoint(device: &Device, completed: usize) {
-    // Submit inner attention/set-transformer chunks asynchronously without draining
-    // the GPU pipeline mid-patch; `checkpoint_patch` paces complete patches.
-    let depth = depth();
-    if depth == 0 || completed % depth == 0 {
-        flush(device);
-    }
+pub(crate) fn checkpoint(_device: &Device, _completed: usize) {
+    // Keep inner attention/set-transformer chunks inside the current stage's command
+    // encoder rather than splitting a single patch into 25-55 micro-submissions;
+    // encoder stages call `flush` and `checkpoint_patch` paces completed patches.
 }
 
 pub(crate) fn flush(device: &Device) {

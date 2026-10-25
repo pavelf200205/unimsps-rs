@@ -3,7 +3,7 @@ use burn::tensor::{Device, DeviceKind, FloatDType};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use unimsps::{
-    cache::{default_cache_dir, init_environment, configure_runtime, build_id, checkpoint_and_report},
+    cache::{default_cache_dir, init_environment, configure_runtime, build_id, checkpoint_and_report, set_freeze_writes},
     model::{Model, ModelOptions, read_tensor, tensor},
     pipeline::{Input, ProcessOptions, SaveFormats, process_with_options, save_with_formats},
 };
@@ -40,8 +40,8 @@ struct Cli {
     /// Spatial attention query limit; 0 uses full chunk budget. Unfused scores remain bounded.
     #[arg(long, default_value_t = 0, global = true)]
     query_batch: usize,
-    /// Images processed together by the spatial encoder (default: 16 so 6-16 light runs execute in one pass).
-    #[arg(long, default_value_t = 16, global = true)]
+    /// Images processed together by the spatial encoder (0 = auto-match images per view, capped at 12).
+    #[arg(long, default_value_t = 0, global = true)]
     encoder_batch: usize,
     /// Auto selects FP16 on supporting GPUs, FP32 on CPU/other adapters.
     #[arg(long, default_value = "auto", value_parser = ["auto", "fp16", "fp32"], global = true)]
@@ -217,27 +217,6 @@ fn main() -> Result<()> {
                 _ if !cli.cpu && device.supports_dtype(FloatDType::F16) => FloatDType::F16,
                 _ => FloatDType::F32,
             };
-            let load_profile = unimsps::profile::phase(&device, || "model/load-and-upload".into());
-            let net = Model::load_with_options(&model, device, ModelOptions {
-                dtype,
-                encoder_batch: cli.encoder_batch,
-                pixel_batch: cli.pixel_batch,
-                query_batch: cli.query_batch,
-                fused_attention: cli.fused_attention && !cli.unfused_attention,
-                score_budget_mib: cli.score_budget_mib,
-                fused_softmax: !cli.burn_softmax,
-                optimized_encoder: !cli.reference_encoder,
-                gemm_convolutions: !cli.burn_convolutions,
-            })?;
-            drop(load_profile);
-            eprintln!(
-                "Precision: {dtype:?}; encoder batch: {}; pixel batch: {}; score budget: {} MiB; formats: {}; attention: {}",
-                cli.encoder_batch,
-                net.options.pixel_batch,
-                net.options.score_budget_mib,
-                save_formats.names().join(","),
-                if net.options.fused_attention { "fused subgroup" } else { "hardware GEMM" }
-            );
             let warmup_lights = if let Some(limit) = image_limit {
                 limit.max(1)
             } else if let Some(first_obj) = objects.first() {
@@ -256,14 +235,40 @@ fn main() -> Result<()> {
                             })
                             .count()
                     })
-                    .unwrap_or(cli.encoder_batch);
+                    .unwrap_or(6);
                 count.max(1)
             } else {
-                cli.encoder_batch
+                6
             };
+            let effective_encoder_batch = if cli.encoder_batch == 0 {
+                warmup_lights.clamp(1, 12)
+            } else {
+                cli.encoder_batch.max(1)
+            };
+            let load_profile = unimsps::profile::phase(&device, || "model/load-and-upload".into());
+            let net = Model::load_with_options(&model, device, ModelOptions {
+                dtype,
+                encoder_batch: effective_encoder_batch,
+                pixel_batch: cli.pixel_batch,
+                query_batch: cli.query_batch,
+                fused_attention: cli.fused_attention && !cli.unfused_attention,
+                score_budget_mib: cli.score_budget_mib,
+                fused_softmax: !cli.burn_softmax,
+                optimized_encoder: !cli.reference_encoder,
+                gemm_convolutions: !cli.burn_convolutions,
+            })?;
+            drop(load_profile);
+            eprintln!(
+                "Precision: {dtype:?}; encoder batch: {}; pixel batch: {}; score budget: {} MiB; formats: {}; attention: {}",
+                effective_encoder_batch,
+                net.options.pixel_batch,
+                net.options.score_budget_mib,
+                save_formats.names().join(","),
+                if net.options.fused_attention { "fused subgroup" } else { "hardware GEMM" }
+            );
             let cache_signature = format!(
                 "{}|{:?}|{}|{:?}|eb={}|pb={}|lights={}|qb={}|scores={}|fa={}|fs={}|oe={}|gc={}",
-                build_id(),net.device.identity(),effective_api,dtype,cli.encoder_batch,
+                build_id(),net.device.identity(),effective_api,dtype,effective_encoder_batch,
                 net.options.pixel_batch,warmup_lights,net.options.query_batch,net.options.score_budget_mib,
                 net.options.fused_attention,net.options.fused_softmax,net.options.optimized_encoder,net.options.gemm_convolutions,
             );
@@ -271,13 +276,20 @@ fn main() -> Result<()> {
             if !cli.no_warmup && !cli.cpu {
                 if was_warmed {
                     eprintln!(
-                        "Using persisted CubeCL autotune & shader cache for {warmup_lights} lights."
+                        "Hydrating WGPU pipelines & fusion cache from persisted CubeCL store for {warmup_lights} lights..."
                     );
+                    set_freeze_writes(true);
+                    let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/hydrate-cached-pipelines".into());
+                    net.warmup(warmup_lights)?;
+                    drop(warmup_profile);
+                    eprintln!("Pipeline hydration complete; normal inference executes on the GPU.");
                 } else {
                     eprintln!("Warming kernels and autotuning for {warmup_lights} lights (first use may be slow)...");
+                    set_freeze_writes(false);
                     let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/compile-and-autotune".into());
                     net.warmup(warmup_lights)?;
                     drop(warmup_profile);
+                    set_freeze_writes(true);
                     if !cli.no_kernel_cache {
                         kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
                         checkpoint_and_report("after preparation");
@@ -316,16 +328,13 @@ fn main() -> Result<()> {
                 let save_profile = unimsps::profile::phase(&net.device, || "output/encode-and-save".into());
                 save_with_formats(&normal, &out, save_formats)?;
                 drop(save_profile);
-                if obj_idx == 0 && !cli.no_kernel_cache && !cli.cpu {
+                if obj_idx == 0 && !cli.no_kernel_cache && !cli.cpu && !was_warmed {
                     kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
-                    if !was_warmed {
-                        checkpoint_and_report("after first view");
-                    }
                 }
                 std::fs::write(
                     out.join("metadata.json"),
                     serde_json::to_vec_pretty(
-                        &serde_json::json!({"width":normal.w,"height":normal.h,"formats":save_formats.names(),"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"api":effective_api,"encoder_batch":cli.encoder_batch,"pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,"optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,"pool_cache_mib":cli.pool_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
+                        &serde_json::json!({"width":normal.w,"height":normal.h,"formats":save_formats.names(),"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"api":effective_api,"encoder_batch":effective_encoder_batch,"pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,"optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,"pool_cache_mib":cli.pool_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
                     )?,
                 )?;
                 println!(
@@ -336,13 +345,13 @@ fn main() -> Result<()> {
                 unimsps::trace::write_report(&out.join("timing_trace.json"),serde_json::json!({
                     "images":input.images.len(),"padded_size":input.size,"queue_depth":cli.queue_depth,
                     "score_budget_mib":cli.score_budget_mib,"pool_cache_mib":cli.pool_cache_mib,
-                    "encoder_batch":cli.encoder_batch,"precision":format!("{dtype:?}"),"api":effective_api,
+                    "encoder_batch":effective_encoder_batch,"precision":format!("{dtype:?}"),"api":effective_api,
                     "kernel_cache_dir":cache_dir,"persistent_cache_enabled":!cli.no_kernel_cache && !cli.cpu,
                     "device":format!("{:?}",net.device.identity())}))?;
                 unimsps::profile::write_report(&out.join("profile.json"), serde_json::json!({
                     "device": format!("{:?}", net.device.identity()), "api": effective_api,
                     "precision": format!("{dtype:?}"), "images": input.images.len(),
-                    "padded_size": input.size, "encoder_batch": cli.encoder_batch,
+                    "padded_size": input.size, "encoder_batch": effective_encoder_batch,
                     "pixel_batch": net.options.pixel_batch, "query_batch": cli.query_batch,
                     "image_cache_mib": cli.image_cache_mib, "unfused_attention": !net.options.fused_attention,
                     "fused_attention": net.options.fused_attention, "score_budget_mib": net.options.score_budget_mib,

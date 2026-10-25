@@ -28,6 +28,22 @@ use turso::transaction::TransactionBehavior;
 use super::{InsertSummary, Insertion, NamespaceSummary, Origin, Storage};
 use crate::bytes::Bytes;
 use crate::sync::{LazyLock, Mutex};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static FREEZE_WRITES: AtomicBool = AtomicBool::new(false);
+
+/// Freeze or unfreeze durable SQLite writes.
+/// Freezing writes after startup warmup prevents noisy mid-batch autotune benchmarks
+/// (recorded while the GPU is under full 512x512 / 1024x1024 memory load) from
+/// polluting the persistent cache across subsequent runs.
+pub fn set_freeze_writes(freeze: bool) {
+    FREEZE_WRITES.store(freeze, Ordering::Relaxed);
+}
+
+/// Whether durable SQLite writes are currently frozen.
+pub fn writes_frozen() -> bool {
+    FREEZE_WRITES.load(Ordering::Relaxed)
+}
 
 /// The database schema this build reads and writes. A file carrying any other
 /// version has its entries table dropped and rebuilt: it is a cache, so the
@@ -242,6 +258,9 @@ impl Database {
     /// Stores `value` under `key`. See [`Storage`] for the rules; in short, a
     /// local value replaces an imported one and nothing else overwrites.
     pub fn insert(&self, namespace: &str, key: &[u8], value: &[u8], origin: Origin) -> Insertion {
+        if writes_frozen() {
+            return Insertion::Stored;
+        }
         self.run("write", namespace, |connection| {
             insert_on(connection, namespace, key, value, origin)
         })
@@ -250,6 +269,9 @@ impl Database {
 
     /// Stores `value` under `key`, overwriting whatever is there.
     pub fn replace(&self, namespace: &str, key: &[u8], value: &[u8], origin: Origin) -> Insertion {
+        if writes_frozen() {
+            return Insertion::Stored;
+        }
         self.run("replace", namespace, |connection| {
             let params = (namespace, key.to_vec(), value.to_vec(), origin_code(origin));
             drive(connection.execute(REPLACE, params))?;
@@ -267,6 +289,12 @@ impl Database {
         entries: &mut dyn Iterator<Item = (Bytes, Bytes)>,
         origin: Origin,
     ) -> InsertSummary {
+        if writes_frozen() {
+            return InsertSummary {
+                stored: entries.count(),
+                ..InsertSummary::default()
+            };
+        }
         let mut connection = self.connection.lock();
         let transaction = match drive(connection.transaction_with_behavior(write_transaction())) {
             Ok(transaction) => transaction,

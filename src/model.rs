@@ -453,8 +453,16 @@ impl Model {
             probabilities.matmul(v.clone())
         };
         let elem_bytes = if self.options.dtype == FloatDType::F16 { 2 } else { 4 };
-        let score_limit = (self.options.score_budget_mib.max(1) * 1024 * 1024usize / (b * heads * m * elem_bytes)).max(1);
-        let score_limit = if spatial { 1usize << score_limit.ilog2() } else { score_limit };
+        let raw_limit = (self.options.score_budget_mib.max(1) * 1024 * 1024usize / (b * heads * m * elem_bytes)).max(1);
+        // Allow up to 25% headroom when snapping spatial attention chunks to a power of two so 9-image
+        // views (raw_limit = 14,563 vs 16,384) keep 16384 / 8192 / 4096 chunks (20 chunks/patch,
+        // unchunked Stage 3, single reused 288 MiB score buffer) instead of halving to 8192 / 4096 / 2048
+        // (52 chunks/patch and >512 tasks/patch).
+        let score_limit = if spatial {
+            1usize << (raw_limit.saturating_mul(5) / 4).max(1).ilog2()
+        } else {
+            raw_limit
+        };
         let requested = if !spatial || self.options.query_batch == 0 { n }
             else { self.options.query_batch.min(n) };
         let queries = if flash { requested } else { requested.min(score_limit) };
@@ -651,19 +659,12 @@ impl Model {
             let _ = self.forward_masked(dummy, true, Some(&mask))?;
         }
 
-        // 3. Warm Net_stage (256x256 patch refinement stage)
-        // A representative mask; individual sparse bucket paths are warmed explicitly below.
-        let dummy_stage = Tensor::zeros([lights, 6, 256, 256], self.tensor_options());
-        let mut mask256 = vec![false; 256 * 256];
-        for y in 32..224 {
-            for x in 32..224 {
-                mask256[y * 256 + x] = true;
-            }
-        }
-        let _ = self.forward_masked(dummy_stage.clone(), true, Some(&mask256))?;
+        crate::execution::purge_pool(&self.device);
 
-        // 4. Warm dense Net_stage (full 256x256 patch without masking)
+        // 3. Warm dense Net_stage (full 256x256 patch; sparse buckets are warmed explicitly below)
+        let dummy_stage = Tensor::zeros([lights, 6, 256, 256], self.tensor_options());
         let _ = self.forward_masked(dummy_stage, true, None)?;
+        crate::execution::purge_pool(&self.device);
 
         // Exercise every sparse pool bucket before any timed view. The zero
         // input is shape-only during compile-only replay; light networks stay dense.

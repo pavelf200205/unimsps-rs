@@ -190,3 +190,9 @@ pub fn checkpoint_and_report(phase:&str) {
         Err(error)=>eprintln!("Cannot inspect/checkpoint the cache database: {error}"),
     }
 }
+
+/// Freeze or unfreeze durable SQLite writes so post-warmup batch execution
+/// never pollutes the persistent autotune store under full VRAM load.
+pub fn set_freeze_writes(freeze: bool) {
+    cubecl_environment::persistence::set_freeze_writes(freeze);
+}

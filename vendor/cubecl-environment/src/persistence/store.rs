@@ -248,7 +248,10 @@ impl<K: StoreKey, V: StoreValue> Store<K, V> {
             generation,
         };
 
-        if matches!(store.cache, CacheOption::Eager) && store.storage.is_some() {
+        // Always ingest all cached entries (both autotune/* and vulkan/* SPIR-V shaders)
+        // in one sequential scan when opening the store so zero synchronous SQLite SELECTs
+        // stall the CPU mid-patch during WGPU pipeline creation.
+        if store.storage.is_some() {
             store.ingest();
         }
 
@@ -305,7 +308,7 @@ impl<K: StoreKey, V: StoreValue> Store<K, V> {
     pub fn remove(&mut self, key: &K) -> Option<V> {
         self.reset_if_stale();
 
-        let value = match self.entries.remove(key) {
+        let value = match self.entries.get(key).cloned() {
             Some(value) => Some(value),
             None => match self.cache {
                 CacheOption::Eager => None,
@@ -545,16 +548,8 @@ impl<K: StoreKey, V: StoreValue> Store<K, V> {
 
     /// Records a value the storage accepted, according to the cache option.
     fn record(&mut self, key: K, value: V) {
-        match self.cache {
-            CacheOption::Eager => {
-                self.entries.insert(key, value);
-            }
-            // The value is dropped rather than memoized: freshly compiled
-            // artifacts are typically never read again by this process.
-            CacheOption::Lazy => {
-                self.known.insert(key);
-            }
-        }
+        self.known.insert(key.clone());
+        self.entries.insert(key, value);
     }
 
     /// Whether the in-memory state belongs to an environment that is no
