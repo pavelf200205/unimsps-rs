@@ -191,7 +191,7 @@ requirements automatically retain that implementation. Latest source changes
 have not been compiled or timed here. FP32 reductions may change FP16 rounding.
 
 `--pool-cache-mib N` controls the allocator reservation threshold that triggers
-cleanup. The existing 1536 MiB default is unchanged. Larger values can retain
+cleanup. The current default is 1024 MiB of total pool reservation. Larger values can retain
 more reusable buffers at the cost of higher reserved VRAM; 0 disables these
 explicit cleanup calls. This is a cleanup trigger, not a hard VRAM limit.
 
@@ -227,7 +227,12 @@ conv-pack and conv-matmul costs. This source change has not been built or timed.
 
 ## Persistent preparation update
 
-See [CACHE_AND_SCHEDULING.md](CACHE_AND_SCHEDULING.md) for the current cache,
-compile-only startup replay, sparse remapping and queue/memory policies. This
-supersedes earlier claims that a workload marker can skip all warmup. A rebuild
-is required to enable the Vulkan compiler and runtime persistence features.
+The default `--cache-mode shaders` persists compiled shader artifacts only.
+Autotuning and hardware-throughput measurements are reused in memory within
+each process. `--cache-mode memory` (or `--no-kernel-cache`) also disables shader
+persistence while preserving all in-process reuse.
+
+`--cache-diagnostics` writes compilation/autotuning logs into `OUT/_runtime`.
+Preparation and view metadata include actual shader database hit/miss counters.
+See [CACHE_AND_SCHEDULING.md](CACHE_AND_SCHEDULING.md) for the cache design,
+the reason for the small local dependency patch, and exact manual run commands.

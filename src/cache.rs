@@ -1,4 +1,4 @@
-//! Persistent CubeCL artifacts and process-local compile-only replay metadata.
+//! Persist compiled shaders; keep tuning and throughput measurements process-local.
 use serde::{Deserialize,Serialize};
 use std::{collections::BTreeSet,path::{Path,PathBuf},sync::OnceLock};
 use cubecl::config::{CubeClRuntimeConfig,RuntimeConfig,cache::CacheConfig};
@@ -7,9 +7,17 @@ use cubecl::config::{CubeClRuntimeConfig,RuntimeConfig,cache::CacheConfig};
 pub struct KernelCache {
     pub version: u32,
     pub warmed_signatures: BTreeSet<String>,
-    pub unavailable_flash_shapes: BTreeSet<String>,
 }
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CacheMode { Shaders, Memory }
+impl CacheMode {
+    pub fn persistent(self) -> bool { self == Self::Shaders }
+    pub fn name(self) -> &'static str {
+        match self { Self::Shaders => "shaders", Self::Memory => "memory" }
+    }
+}
 
 pub fn default_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("UNIMSPS_CACHE_DIR") {
@@ -19,80 +27,56 @@ pub fn default_cache_dir() -> PathBuf {
         .unwrap_or_else(||PathBuf::from(".")).join(".unimsps-kernels")
 }
 
-/// A rebuilt executable gets a fresh environment; repeated launches reuse it.
+/// Content identity supplied by build.rs; copying the executable preserves it.
 pub fn build_id() -> &'static str {
-    static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(|| {
-        let metadata = std::env::current_exe().ok().and_then(|p|std::fs::metadata(p).ok());
-        let size = metadata.as_ref().map_or(0,|m|m.len());
-        let time = metadata.and_then(|m|m.modified().ok())
-            .and_then(|t|t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0,|d|d.as_nanos());
-        format!("v{CACHE_VERSION}-{size:x}-{time:x}")
-    })
+    env!("UNIMSPS_CACHE_BUILD_ID")
 }
 
-/// Must run before any device/configuration is initialized. The runtime store
-/// persists SPIR-V and autotune choices; a manifest alone never skips replay.
-fn set_env_if_absent<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, val: V) {
-    if std::env::var_os(key.as_ref()).is_none() {
-        unsafe {
-            std::env::set_var(key, val);
-        }
-    }
-}
-
-pub fn configure_runtime(cache_dir: &Path, enabled: bool) {
+/// Configure once, before any device/configuration is initialized.
+pub fn configure_runtime(cache_dir: &Path, mode: CacheMode, diagnostics: Option<&Path>) -> anyhow::Result<()> {
     install_warning_logger();
-    if enabled {
-        let driver_gl_dir = cache_dir.join("nvidia_gl_cache");
-        let driver_cuda_dir = cache_dir.join("nvidia_compute_cache");
-        let driver_mesa_dir = cache_dir.join("mesa_shader_cache");
-        let _ = std::fs::create_dir_all(&driver_gl_dir);
-        let _ = std::fs::create_dir_all(&driver_cuda_dir);
-        let _ = std::fs::create_dir_all(&driver_mesa_dir);
-
-        set_env_if_absent("__GL_SHADER_DISK_CACHE", "1");
-        set_env_if_absent("__GL_SHADER_DISK_CACHE_PATH", &driver_gl_dir);
-        set_env_if_absent("__GL_SHADER_DISK_CACHE_SIZE", "2147483648");
-        set_env_if_absent("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1");
-
-        set_env_if_absent("CUDA_CACHE_DISABLE", "0");
-        set_env_if_absent("CUDA_CACHE_PATH", &driver_cuda_dir);
-        set_env_if_absent("CUDA_CACHE_MAXSIZE", "2147483648");
-
-        set_env_if_absent("MESA_SHADER_CACHE_DIR", &driver_mesa_dir);
-        set_env_if_absent("MESA_SHADER_CACHE_MAX_SIZE", "2G");
-    }
-    cubecl_environment::records::configure(cubecl_environment::records::RecordsConfig {
-        level: cubecl_environment::records::RecordLevel::Off,
-        keep_sessions: Some(0),
+    use cubecl_environment::persistence::{set_persistence_policy, PersistencePolicy};
+    set_persistence_policy(match mode {
+        CacheMode::Shaders => PersistencePolicy::Shaders,
+        CacheMode::Memory => PersistencePolicy::Memory,
     });
     let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
-    config.compilation.cache = enabled;
-    config.autotune.disable_cache = !enabled;
-    config.throughput.disable_cache = !enabled;
+    config.compilation.cache = mode.persistent();
+    // This official switch preserves the tuner's in-memory winner cache.
+    config.autotune.disable_cache = true;
+    // Unlike autotune, disabling this flag bypasses RAM reuse too. Keep it on;
+    // the storage policy routes the throughput namespace to MemoryStorage.
+    config.throughput.disable_cache = false;
     config.environment.records.level = cubecl_environment::records::RecordLevel::Off;
     config.environment.records.keep_sessions = Some(0);
     config.environment.path = CacheConfig::Directory(cache_dir.join("runtime"));
     config.environment.name = format!("unimsps-{}",build_id());
-    if !CubeClRuntimeConfig::try_set(config) {
-        eprintln!("Runtime configuration was already initialized; cache settings could not be applied.");
+    if let Some(dir) = diagnostics {
+        std::fs::create_dir_all(dir)?;
+        config.compilation.logger.level = cubecl::config::compilation::CompilationLogLevel::Basic;
+        config.compilation.logger.file = Some(dir.join("compilation.log"));
+        config.compilation.logger.append = false;
+        config.autotune.decisions.file = Some(dir.join("autotune.jsonl"));
+        config.autotune.decisions.append = false;
+        eprintln!("Cache diagnostic logs: {}", dir.display());
     }
-    if enabled {
+    anyhow::ensure!(CubeClRuntimeConfig::try_set(config), "CubeCL was initialized before cache configuration");
+    eprintln!("Cache mode: {}; tuning and throughput measurements: process memory; build: {}", mode.name(), build_id());
+    if mode.persistent() {
         eprintln!("Persistent CubeCL store: {} (environment unimsps-{})",cache_dir.join("runtime").display(),build_id());
         probe_database();
     }
+    Ok(())
 }
 
 pub fn init_environment(cache_dir: &Path, _explicit_custom_dir: bool) -> KernelCache {
     if let Err(error) = std::fs::create_dir_all(cache_dir) {
         eprintln!("Cannot create cache directory {}: {error}",cache_dir.display());
     }
-    let cache = std::fs::read(cache_dir.join("kernel_state.json")).ok()
+    let cache = std::fs::read(cache_dir.join(format!("kernel-state-{}.json", build_id()))).ok()
         .and_then(|b|serde_json::from_slice::<KernelCache>(&b).ok())
         .filter(|c|c.version==CACHE_VERSION)
         .unwrap_or_else(||KernelCache { version:CACHE_VERSION,..Default::default() });
-    crate::attention::load_unavailable(cache.unavailable_flash_shapes.iter().cloned());
     cache
 }
 impl KernelCache {
@@ -100,12 +84,11 @@ impl KernelCache {
     pub fn is_warmed(&self,signature:&str)->bool { self.warmed_signatures.contains(signature) }
     pub fn record_and_save(&mut self,cache_dir:&Path,signature:Option<String>) {
         if let Some(signature)=signature { self.warmed_signatures.insert(signature); }
-        self.unavailable_flash_shapes.extend(crate::attention::snapshot_unavailable());
         self.version=CACHE_VERSION;
         let saved = (|| -> Result<(),Box<dyn std::error::Error>> {
             std::fs::create_dir_all(cache_dir)?;
             // Runtime artifacts live in the CubeCL database; this file only records workloads.
-            std::fs::write(cache_dir.join("kernel_state.json"),serde_json::to_vec_pretty(self)?)?;
+            std::fs::write(cache_dir.join(format!("kernel-state-{}.json", build_id())),serde_json::to_vec_pretty(self)?)?;
             Ok(())
         })();
         if let Err(error)=saved { eprintln!("Could not save warmup metadata: {error}"); }
@@ -191,8 +174,23 @@ pub fn checkpoint_and_report(phase:&str) {
     }
 }
 
-/// Freeze or unfreeze durable SQLite writes so post-warmup batch execution
-/// never pollutes the persistent autotune store under full VRAM load.
-pub fn set_freeze_writes(freeze: bool) {
-    cubecl_environment::persistence::set_freeze_writes(freeze);
+pub use cubecl_environment::persistence::{ShaderCacheStats, shader_cache_stats};
+
+/// Counters concern database reads/writes, not live pipeline hits or GPU timing.
+pub fn cache_delta(before: ShaderCacheStats) -> serde_json::Value {
+    let now = shader_cache_stats();
+    serde_json::json!({
+        "shader_db_hits": now.read_hits.saturating_sub(before.read_hits),
+        "shader_db_misses": now.read_misses.saturating_sub(before.read_misses),
+        "shader_db_accepted_writes": now.accepted_writes.saturating_sub(before.accepted_writes),
+        "shader_db_write_failures": now.write_failures.saturating_sub(before.write_failures),
+        "shader_db_read_ms": now.read_ns.saturating_sub(before.read_ns) as f64 / 1e6,
+        "shader_db_write_ms": now.write_ns.saturating_sub(before.write_ns) as f64 / 1e6,
+    })
+}
+
+pub fn report_reuse(phase: &str) {
+    let s = shader_cache_stats();
+    eprintln!("Shader DB {phase}: {} hits, {} misses, {} accepted writes, {} write failures; read {:.1} ms / write {:.1} ms (process totals)",
+        s.read_hits,s.read_misses,s.accepted_writes,s.write_failures,s.read_ns as f64/1e6,s.write_ns as f64/1e6);
 }

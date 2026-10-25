@@ -334,6 +334,9 @@ pub struct NamespaceSummary {
 /// Empty without a durable backend: memory namespaces do not outlive the
 /// process that wrote them.
 pub fn namespaces() -> Vec<String> {
+    // Throughput's legacy-cache cleanup must not open the database in memory
+    // mode or enumerate shader storage when its own namespace is memory-only.
+    if super::persistence_policy() != super::PersistencePolicy::All { return Vec::new(); }
     cfg_if::cfg_if! {
         if #[cfg(any(native_cache, browser_cache))] {
             super::turso::summary()
@@ -353,6 +356,12 @@ pub fn namespaces() -> Vec<String> {
 /// can't be opened somewhere else without making "a single active
 /// environment" false. See [`crate::environment`].
 pub fn open(namespace: &str) -> Box<dyn Storage> {
+    let durable = match super::persistence_policy() {
+        super::PersistencePolicy::All => true,
+        super::PersistencePolicy::Shaders => super::cache_policy::is_shader(namespace),
+        super::PersistencePolicy::Memory => false,
+    };
+    if !durable { return Box::new(MemoryStorage::in_environment(namespace)); }
     cfg_if::cfg_if! {
         if #[cfg(any(native_cache, browser_cache))] {
             match super::turso::open(namespace) {

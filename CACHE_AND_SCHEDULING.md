@@ -1,163 +1,119 @@
-# Persistent preparation and bounded execution
+# Shader persistence (v4)
 
-CubeCL 0.11 supports persistent compiled SPIR-V artifacts and autotune decisions.
-The project now enables cubecl/vulkan and cubecl/persistence and configures the
-runtime store before initializing the device. No CUDA dependency is required.
-The runtime database is under <kernel-cache-dir>/runtime, with a separate named
-environment for each executable build. Moving the working directory does not
-change this root. --kernel-cache-dir and UNIMSPS_CACHE_DIR select the root.
---no-kernel-cache disables compiled-artifact and tuning persistence.
+The default is now `--cache-mode shaders`. Compiled Vulkan SPIR-V (or CUDA
+artifacts on the optional CUDA backend) persists across processes. Autotune winners
+and hardware-throughput measurements are computed anew per process and reused in
+RAM. `--cache-mode memory`, also selected by `--no-kernel-cache`, keeps all runtime
+caching in RAM. Neither mode repeatedly disables in-process reuse.
 
-The first launch may still compile and tune many shapes. Subsequent launches
-of the same executable reuse those artifacts. Rebuilding the executable selects
-a new environment to avoid stale artifacts across code changes. Copying the
-executable without changing its size/timestamp preserves its environment name.
-Autotune keys and compilation stores provide additional runtime/device namespacing.
+## What was corrected
 
-The workload JSON is historical metadata only. It never bypasses process-local
-setup. Startup uses CubeCL DryRun for shape-driven model passes: ordinary kernels
-are loaded/compiled but not dispatched. Autotuning measurements still execute if
-no tuning decision exists. A final GPU synchronization drains all deferred fusion
-work before the guard is dropped, so actual inference runs normally afterwards.
-Warmup does not read generated outputs. Sparse pool buckets 256..32768 are
-prepared explicitly in addition to dense 32/64/128/256-scale networks.
---no-warmup skips this replay, at the cost of first-use setup during inference.
+CubeCL already has a process-local compiled-pipeline cache in front of its disk
+artifact store. `Store::remove` consumes a cached artifact from RAM after loading;
+it does not delete the durable entry. Its lazy loading and consumption semantics
+are restored exactly to upstream. Forced eager ingestion, cloning retained shader
+entries, the shared-connection rewrite, and writes that falsely returned Stored
+have been removed. All actual shader cache misses may be saved, including those
+first encountered during a view.
 
-SPIR-V artifact persistence applies to the Vulkan compiler path. DX12/Metal via
-WGSL still need driver compilation; autotune persistence remains useful there.
-A disk artifact is not a serialized live device or driver pipeline. Some pipeline
-creation, fusion setup, buffer allocation and shapes outside preparation remain
-process-local, so zero startup cost or identical first/later views is not promised.
+`autotune.disable_cache = true` is the official disk-only switch. In contrast,
+`throughput.disable_cache = true` bypasses RAM reuse too. We leave that false and
+route its namespace to MemoryStorage. Runtime records are disabled. The app no
+longer sets NVIDIA/Mesa driver cache environment variables. Flash-attention
+failure decisions are rediscovered in each process.
 
-# Memory access and quality
+A shader artifact is not a live driver pipeline. Loading it still creates the
+module/pipeline and process-local fusion state. Startup performs the existing real
+warmup for every process; it no longer changes behavior based on a JSON marker or
+freezes persistence. Workload markers are historical hints only. Shader-only mode
+still pays for fresh tuning, so startup cannot be assumed to become instantaneous.
 
-Only pool transformers use foreground gathering. Light transformers remain dense
-because later encoder stages use global attention. Decoder dependency-cone masks,
-FP32 normal blending and prior-halo handling are unchanged.
+The build hash covers sources, dependency lockfile, manifests, toolchain and build
+settings. It now selects `unimsps-v4-shaders-...` in `<cache-dir>/runtime`.
+Old caches are left intact and are not loaded. Six- and nine-image shader variants
+can coexist under the same build and device keys; image count is not a reason to
+switch environments or discard previous variants.
 
-Gather and inverse scatter use one output element per lane and contiguous output
-channels. Foreground indices remain in raster order. The inverse map has one entry
-per output pixel: a foreground row or -1. It directly writes zero for background,
-with no serial scatter loop, atomics, trash slot or repeated padding accumulation.
-The fixed bucket/output shapes avoid compiling for every foreground count. Small
-power-of-two buckets restore the previous low padding cost; 8192 is supported.
-Non-Cube backends keep the generic valid-row fallback.
+This change intentionally keeps Burn 0.22.0 / CubeCL 0.11.0 / CubeK 0.3.0 and the
+current inference kernels and scheduling. It targets cache semantics specifically.
 
---queue-depth now counts completed patches, not inner attention/set-transformer
-chunks. Default 1 bounds CPU lead at one complete patch; inner work is submitted
-asynchronously. 0 removes patch waits. Skipped patches do not consume queue slots.
---pool-cache-mib is an unused reservation threshold checked at scale boundaries,
-not a hard VRAM cap. It no longer purges based on allocations still in use, and
-view readback no longer unconditionally discards reusable buffers/uniform metadata.
-0 disables explicit trimming. Memory use can exceed this threshold due to live
-activations, queued work, weights and cached input images.
+## Why a local environment crate remains
 
-# Manual validation
+The exact 0.11.0 source was checked against the installed registry package:
 
-Rebuild with cargo build --release. The Vulkan compiler/persistence features may
-require Cargo.lock updates and dependency downloads on the first build.
-Launch the same workload twice with the same binary and cache directory. Compare
-startup preparation time, first-view time, later-view time and maximum patch delay.
-Use normal execution for throughput; --verbose adds GPU synchronization.
-Do not reuse a cache marker as evidence of successful artifact retrieval.
+- StoreOptions::storage_with permits custom storage for stores an application
+  constructs. It does not override the stores built inside CubeCL's runtime.
+- CacheConfig chooses locations, with no memory or namespace-routing variant.
+- ThroughputCache::new unconditionally selects environment storage when compiled
+  with persistence. Disabling throughput caching does not offer memory-only reuse.
+- Turso is opened with experimental_multiprocess_wal(true). Turso 0.8.3 WindowsIO
+  inherits supports_shared_wal_coordination() == false. The local Windows-only
+  compatibility adjustment is still needed for this installed stack.
 
-This change was inspected in source only. No compilation, inference, benchmarks
-or numerical comparisons were executed by the coding agent. Startup savings,
-steady-state speed, driver behavior and VRAM consumption remain to be measured.
+Thus a local patch remains necessary for this shader-only policy on the pinned
+stack. It is limited to startup storage routing, Windows WAL compatibility,
+checkpoint exposure and diagnostic counters. Store itself is byte-for-byte
+upstream. No global Cargo registry source is modified. See
+vendor/cubecl-environment/UNIMSPS_PATCH.md for the exact patch boundary.
 
-# Windows persistence repair
+## Diagnostics and interpretation
 
-A zero-byte main .db with no WAL sidecar was traced to the installed
-cubecl-environment 0.11.0 opening Turso 0.8.3 with experimental multiprocess WAL.
-Turso's default WindowsIO lacks shared-WAL byte-locking/mapping primitives, and
-database initialization is rejected. CubeCL silently falls back to MemoryStorage
-when its log warnings have no installed sink.
+Every view's metadata records cache/build identity, preparation time, shader DB
+hits/misses/accepted writes/I/O duration during preparation and that view, live
+allocator usage, inference time and output time. Shader DB hits mean bytes were
+retrieved: they do not count live pipeline hits, certify successful decoding, or
+measure GPU execution. A warm pipeline performs no DB read on every dispatch.
+A cache read failure also counts as a miss and is logged separately as a warning.
 
-The repository-local Cargo patch in vendor/cubecl-environment disables that
-experimental mode on Windows only. Normal Windows database locking remains in
-use; Unix multiprocess WAL is unchanged. Concurrent Windows instances should
-use separate cache directories, since the default Windows backend locks the
-cache file rather than supporting concurrent multiprocess WAL writers.
-The patch does not modify the global Cargo registry or neural inference code.
+With `--cache-diagnostics`, OUT/_runtime contains:
+- preparation.json: startup duration, per-preparation and process-total counters.
+- compilation.log: CubeCL's native basic compilation log on actual compilation.
+- autotune.jsonl: CubeCL's native tuning decision records, including candidates.
 
-A cache-only warning logger now exposes database failures. Startup explicitly
-opens the active database, writes and reads a small probe if absent, and reports
-whether it found the probe from an earlier process. This checks real durable
-storage rather than a JSON warmup marker. Namespace statistics report compiled
-artifacts, autotune decisions and payload bytes at startup, after preparation
-and at normal exit.
+These log sinks do not enable GPU profiling waits. Fresh tuning is expected on
+every process. A repeated run should show shader DB hits; additional misses may
+occur when tuning explores a previously unseen candidate. Timing differences
+between cold and warm runs include tuning and driver setup, so they are not a
+pure shader-compilation benchmark. The shader database should have zero autotune
+and throughput entries. It may also contain the small persistence probe.
 
-Turso does not automatically checkpoint on close. An explicit checkpoint after
-preparation and at exit folds committed WAL frames into the main .db. While a
-program is running, an unchanged/small .db alone does not imply failure: entries
-may still be in the -wal sidecar. Never remove a live -wal file. A failed/busy
-checkpoint is reported; the committed WAL remains part of the database.
+The Windows main DB may be small while committed data resides in its WAL.
+Checkpointing runs after preparation and at exit. Do not delete a live WAL.
+Concurrent Windows processes should use separate writable cache directories.
 
-After rebuilding, the first run creates a new environment (build ID changes).
-On a second run of that exact binary with identical options, look for
-previous-process probe: found and nonzero compiled-artifact/tuning counts at
-startup. Preparation still replays shapes to hydrate process-local pipelines.
-The agent did not compile, open the database through Turso, or run inference;
-the repair is based on source inspection and must be verified by the user's run.
+## Manual sequence
 
-# Diagnosing intermittent execution stalls
+The coding agent did not compile, run tests or run inference. From unimsps-rs,
+build once and then run four separate processes with the same executable and
+cache root. Use 6 -> 6 -> 9 -> 6, so ordinary reuse is checked before changing
+image count. Keep other GPU workloads quiet, leave --verbose and --trace-gpu off,
+and keep the cache between all four runs. --trace-performance adds wall-clock
+patch tracing without extra GPU waits.
 
---trace-performance writes timing_trace.json per view without adding device
-synchronizations. It records patch preparation, network submission, blending,
-flush/completion wait, and pool usage after waits already requested by the
-queue policy. Network submission is not pure CPU time: it can include blocked
-driver calls, tuning, compilation or GPU work. At queue depth 0, times can
-represent submission rather than completion and pool samples are omitted.
-Slow patches over two seconds print a concise console record. Allocator checks
-and cleanup durations are recorded separately. Disabled by default.
+```powershell
+cargo build --release
+$tag = Get-Date -Format 'yyyyMMdd_HHmmss'
+$common = @('--batch', '--model', '..\unimsps-weights\model_uncalibrated.safetensors', '--data', '..\data\own_objects_normals\horse_960\mvps_png_full', '--kernel-cache-dir', ".\experiments\cache_v4_$tag", '--cache-mode', 'shaders', '--cache-diagnostics', '--trace-performance')
+.\target\release\unimsps.exe infer @common --nb_img 6 --out ".\experiments\v4_${tag}_6a"
+.\target\release\unimsps.exe infer @common --nb_img 6 --out ".\experiments\v4_${tag}_6b"
+.\target\release\unimsps.exe infer @common --nb_img 9 --out ".\experiments\v4_${tag}_9"
+.\target\release\unimsps.exe infer @common --nb_img 6 --out ".\experiments\v4_${tag}_6c"
+```
 
-Run this without --verbose when diagnosing real throughput. Pool data only
-describes this process's allocations; it does not report the Windows adapter
-budget, other processes, GPU clock, power or temperature. The trace is not a
-GPU kernel profiler. No scheduling or inference behavior was changed for this
-diagnostic feature.
+If a run slows down, preserve these directories and its console output. Do not
+purge the cache: the bad state is valuable evidence. A memory-only control can
+then be run with --cache-mode memory, using the same binary and new output path.
+The correct control now preserves RAM throughput reuse.
 
-For external contention, tools/monitor_gpu.ps1 can be launched manually in
-a second PowerShell window. It records Windows GPU engine utilization and
-dedicated/shared memory counters, including process IDs and names, plus available
-system RAM. Example from the unimsps-rs folder:
+## Documentation consulted
 
-powershell -File tools/monitor_gpu.ps1 -Out experiments/gpu_resources.csv -Seconds 900
+- https://tracel.ai/blog/release-0.22.0/ (environments, adaptive tuning, throughput)
+- https://docs.rs/cubecl-server/latest/cubecl_server/compiler/index.html (two cache layers)
+- https://docs.rs/cubecl-environment/latest/src/cubecl_environment/environment.rs.html (environment lifetime)
+- Installed 0.11.0 API source: persistence/store.rs, persistence/storage.rs,
+  persistence/root.rs, config/autotune.rs, throughput/cache.rs,
+  throughput/benchmarker.rs, and cubecl-wgpu/src/backend/base.rs.
 
-Counter names may need localization on non-English Windows installations.
-The script does not change power, clocks or priority and has not been executed
-by the agent. Per-engine utilization should not be blindly summed across engines
-or adapters. Clocks/temperature need a separate hardware monitor.
-
-# Device timestamps for intermittent stalls
-
-`--trace-gpu` implies `--trace-performance` and adds one device timing window
-per executed patch, plus CPU submission spans for each encoder batch, pooling,
-light transformer and decoder. It cannot be combined with `--verbose`. This is
-diagnostic instrumentation, not a change to the model, queue depth or allocator
-policy. It uses Burn's portable profiling API, without a CUDA/NVIDIA dependency.
-
-The patch still flushes its final operations and uses the existing patch wait.
-Timestamp results are retained and resolved after the normal map's readback,
-when writing `timing_trace.json`. Profiling itself changes command boundaries,
-adds timestamp readbacks, and can add backend waits (notably Metal and the
-system-clock fallback). Do not treat profiled throughput as an unaffected
-baseline. A disappearance of the stalls only with this flag is useful evidence
-about command boundaries/polling, not proof that normal execution is fixed.
-
-Trace format 2 splits `flush_and_completion_wait` into `final_flush` and
-`completion_wait`. With device profiling enabled, `gpu_window_close` also
-records the host time needed to close the window. `patch_device_window` rows
-carry the same scale/x/y as their patch and report `timing_method` plus
-`device_elapsed_ms`, or `system_elapsed_ms` for a fallback. Missing measurements
-are null, never zero. Device elapsed time spans the command stream's first and
-last sampled work; it includes intervening submission gaps/preemption and is
-not the sum of individual kernels' busy times. CPU stage rows may reflect
-runtime backpressure and lazy work from previous stages.
-
-Use a new output folder and keep the other inference settings unchanged. One
-nine-image run that includes both fast and stalled patches is useful; there is
-no need to repeat the cache-isolation sequence or run monitor_gpu.ps1. Rebuild
-manually with `cargo build --release`, then add `--trace-gpu` to the usual
-command. The new executable gets a new cache environment, so first preparation
-can take longer. Neither compilation nor inference was run by the coding agent.
+Version-specific installed source was used where online docs described a different
+release. Cache isolation is implemented; eliminating the observed slowdown remains
+to be verified by the user's runs.

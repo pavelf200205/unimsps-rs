@@ -1,15 +1,34 @@
 # Local persistence patch
 
-Upstream: cubecl-environment 0.11.0, MIT OR Apache-2.0.
+Base: cubecl-environment 0.11.0, MIT OR Apache-2.0.
 
-Changes in src/persistence/turso.rs:
-- Disable experimental multiprocess WAL on Windows only. Turso 0.8.3 default
-  WindowsIO does not implement shared-WAL coordination; the old open falls back
-  to process memory. The normal Windows file lock remains active. Concurrent
-  processes cannot share one writable cache; use separate --kernel-cache-dir
-  values when running multiple instances. Unix multiprocess WAL is unchanged.
-- Expose Database::checkpoint to fold committed WAL data into the main cache
-  database without changing journal mode or closing active runtime connections.
+Only these source files differ from the registry package:
+- persistence/cache_policy.rs (new): startup-only All/Shaders/Memory policy and
+  shader DB telemetry counters. Configure before opening stores/devices; the
+  policy is never changed during inference.
+- persistence/mod.rs: expose that policy and its counters.
+- persistence/storage.rs: route noncompiler namespaces to existing MemoryStorage
+  in Shaders mode, all namespaces in Memory mode. Avoid durable namespace scans
+  from the throughput cleaner in those modes.
+- persistence/turso.rs: disable experimental multiprocess WAL on Windows only;
+  expose checkpoint; block direct runtime-record opens in restricted modes and
+  all explicit DB opens in Memory mode; count shader reads/inserts. Ordinary
+  file locking and upstream connection/transaction behavior remain intact.
 
-This patch is scoped to unimsps-rs by Cargo's local patch section.
-No global Cargo registry files were modified.
+Shader namespaces are vulkan/ and cuda/, as used by CubeCL 0.11.0. Recheck these
+prefixes when upgrading. Database probe/reporting uses explicit opens in Shaders
+mode, while runtime records are off. Diagnostic counters cover DB reads/inserts,
+not decoded artifacts, live pipeline reuse, compilation duration or GPU time.
+
+persistence/store.rs is exactly upstream: lazy/eager behavior, remove, write-through
+conflicts and storage failure semantics have not been changed. There is no write
+freeze or shared-connection replacement.
+
+This patch is required because the pinned runtime constructs its own environment
+stores and has no public per-namespace routing hook. The autotune disk-only switch
+is used directly; the throughput switch would also disable RAM reuse. Upstream's
+Turso multiprocess WAL setting also needs the Windows compatibility adjustment.
+
+Concurrent Windows instances should use separate cache directories. No global
+Cargo registry source was edited. Full rationale and manual sequence are in
+../../CACHE_AND_SCHEDULING.md.

@@ -39,5 +39,5 @@ fn main() {
     let compiler = Command::new(env::var_os("RUSTC").expect("RUSTC")).arg("--version").output().expect("rustc version");
     assert!(compiler.status.success(), "could not identify compiler");
     hash_part(&mut hash, &compiler.stdout);
-    println!("cargo:rustc-env=UNIMSPS_CACHE_BUILD_ID=v3-{hash:016x}");
+    println!("cargo:rustc-env=UNIMSPS_CACHE_BUILD_ID=v4-shaders-{hash:016x}");
 }

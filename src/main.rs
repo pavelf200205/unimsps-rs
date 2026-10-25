@@ -3,7 +3,8 @@ use burn::tensor::{Device, DeviceKind, FloatDType};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use unimsps::{
-    cache::{default_cache_dir, init_environment, configure_runtime, build_id, checkpoint_and_report, set_freeze_writes},
+    cache::{CacheMode, default_cache_dir, init_environment, configure_runtime, build_id, checkpoint_and_report,
+        shader_cache_stats, cache_delta, report_reuse},
     model::{Model, ModelOptions, read_tensor, tensor},
     pipeline::{Input, ProcessOptions, SaveFormats, process_with_options, save_with_formats},
 };
@@ -76,10 +77,16 @@ struct Cli {
     /// Comma-separated normal map formats to save: exr, png, mat, f32, or all (default: exr,png).
     #[arg(long, visible_aliases = ["format", "save-formats", "save_formats"], value_delimiter = ',', default_value = "exr,png", global = true)]
     formats: Vec<String>,
-    /// Directory for persistent compiled kernels, autotune choices, and workload metadata.
+    /// Directory for persistent compiled shaders and workload metadata.
     #[arg(long, visible_aliases = ["cache-dir", "cache_dir"], global = true)]
     kernel_cache_dir: Option<PathBuf>,
-    /// Disable persistent GPU kernel caching across runs.
+    /// Persist compiled shaders only (default), or keep all caches in process memory.
+    #[arg(long, value_enum, default_value = "shaders", global = true)]
+    cache_mode: CacheMode,
+    /// Write compilation and autotune logs under OUT/_runtime, without GPU profiling waits.
+    #[arg(long, global = true)]
+    cache_diagnostics: bool,
+    /// Alias for --cache-mode memory; preserves in-process pipeline/tuning/throughput reuse.
     #[arg(long, global = true)]
     no_kernel_cache: bool,
     #[command(subcommand)]
@@ -116,7 +123,7 @@ enum Command {
 fn main() -> Result<()> {
     let program_start = std::time::Instant::now();
     let cli = Cli::parse();
-    eprintln!("unimsps 0.1.2 (WGPU/CUDA native GEMM + persistent kernel cache build)");
+    eprintln!("unimsps (shader-only persistence; Burn 0.22.0 / CubeCL 0.11.0)");
     unimsps::profile::configure(cli.verbose);
     unimsps::trace::configure(cli.trace_performance);
     unimsps::trace::configure_gpu(cli.trace_gpu);
@@ -124,8 +131,14 @@ fn main() -> Result<()> {
     unimsps::execution::configure_pool_cache(cli.pool_cache_mib);
 
     let cache_dir = cli.kernel_cache_dir.clone().unwrap_or_else(default_cache_dir);
-    configure_runtime(&cache_dir, !cli.no_kernel_cache && !cli.cpu);
-    let mut kernel_cache = if !cli.no_kernel_cache && !cli.cpu {
+    let cache_mode = if cli.no_kernel_cache || cli.cpu { CacheMode::Memory } else { cli.cache_mode };
+    let persistent_cache = cache_mode.persistent();
+    let diagnostics_dir = cli.cache_diagnostics.then(|| match &cli.command {
+        Command::Infer { out, .. } => out.join("_runtime"),
+        _ => cache_dir.join("diagnostics"),
+    });
+    configure_runtime(&cache_dir, cache_mode, diagnostics_dir.as_deref())?;
+    let mut kernel_cache = if persistent_cache {
         init_environment(&cache_dir, cli.kernel_cache_dir.is_some())
     } else {
         Default::default()
@@ -180,7 +193,7 @@ fn main() -> Result<()> {
     };
     eprintln!("Device: {:?} (api: {effective_api})", device.identity());
     eprintln!("Queue depth: {} (0 = asynchronous flush)", cli.queue_depth);
-    if !cli.no_kernel_cache && !cli.cpu {
+    if persistent_cache {
         eprintln!("Kernel cache: {}", cache_dir.display());
     }
 
@@ -272,30 +285,37 @@ fn main() -> Result<()> {
                 net.options.pixel_batch,warmup_lights,net.options.query_batch,net.options.score_budget_mib,
                 net.options.fused_attention,net.options.fused_softmax,net.options.optimized_encoder,net.options.gemm_convolutions,
             );
-            let was_warmed = !cli.no_kernel_cache && kernel_cache.is_warmed(&cache_signature);
+            let was_warmed = persistent_cache && kernel_cache.is_warmed(&cache_signature);
+            let preparation_start = std::time::Instant::now();
+            let preparation_before = shader_cache_stats();
             if !cli.no_warmup && !cli.cpu {
                 if was_warmed {
-                    eprintln!(
-                        "Hydrating WGPU pipelines & fusion cache from persisted CubeCL store for {warmup_lights} lights..."
-                    );
-                    set_freeze_writes(true);
-                    let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/hydrate-cached-pipelines".into());
-                    net.warmup(warmup_lights)?;
-                    drop(warmup_profile);
-                    eprintln!("Pipeline hydration complete; normal inference executes on the GPU.");
+                    eprintln!("Previously seen workload: loading available shaders and tuning this process for {warmup_lights} lights...");
                 } else {
-                    eprintln!("Warming kernels and autotuning for {warmup_lights} lights (first use may be slow)...");
-                    set_freeze_writes(false);
-                    let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/compile-and-autotune".into());
-                    net.warmup(warmup_lights)?;
-                    drop(warmup_profile);
-                    set_freeze_writes(true);
-                    if !cli.no_kernel_cache {
-                        kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
-                        checkpoint_and_report("after preparation");
-                    }
-                    eprintln!("Kernel warmup complete; normal inference executes on the GPU.");
+                    eprintln!("Preparing shaders and process-local tuning for {warmup_lights} lights...");
                 }
+                // A real warmup on every launch. Disk artifacts are loaded lazily;
+                // tuning/throughput decisions are new and then reused in RAM.
+                let warmup_profile = unimsps::profile::phase(&net.device, || "warmup/shaders-and-process-local-tuning".into());
+                net.warmup(warmup_lights)?;
+                drop(warmup_profile);
+                if persistent_cache {
+                    kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
+                    checkpoint_and_report("after preparation");
+                }
+            }
+            let preparation_seconds = preparation_start.elapsed().as_secs_f64();
+            let preparation_cache = cache_delta(preparation_before);
+            eprintln!("Preparation complete ({preparation_seconds:.2}s).");
+            report_reuse("after preparation");
+            if let Some(dir) = &diagnostics_dir {
+                std::fs::write(dir.join("preparation.json"), serde_json::to_vec_pretty(&serde_json::json!({
+                    "seconds":preparation_seconds,"cache":preparation_cache,
+                    "process_totals":cache_delta(Default::default()),"cache_mode":cache_mode.name(),
+                    "cache_build_id":build_id(),"kernel_cache_dir":cache_dir,"images":warmup_lights,
+                    "encoder_batch":effective_encoder_batch,"precision":format!("{dtype:?}"),
+                    "warmup_enabled":!cli.no_warmup && !cli.cpu,"previous_workload_marker":was_warmed
+                }))?)?;
             }
             for (obj_idx, object) in objects.into_iter().enumerate() {
                 let out = if batch {
@@ -318,35 +338,57 @@ fn main() -> Result<()> {
                     input.size
                 );
                 let start = std::time::Instant::now();
+                let view_cache_before = shader_cache_stats();
                 let inference_profile = unimsps::profile::phase(&net.device, || "inference/total".into());
                 let normal = process_with_options(&net, &input,
                     ProcessOptions { image_cache_mib: cli.image_cache_mib })?;
                 drop(inference_profile);
+                let inference_seconds = start.elapsed().as_secs_f64();
                 let restore_profile = unimsps::profile::phase(&net.device, || "output/restore-crop".into());
                 let normal = input.restore(&normal);
                 drop(restore_profile);
                 let save_profile = unimsps::profile::phase(&net.device, || "output/encode-and-save".into());
                 save_with_formats(&normal, &out, save_formats)?;
                 drop(save_profile);
-                if obj_idx == 0 && !cli.no_kernel_cache && !cli.cpu && !was_warmed {
+                if obj_idx == 0 && persistent_cache && !was_warmed {
                     kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
                 }
+                let view_seconds = start.elapsed().as_secs_f64();
+                let view_cache = cache_delta(view_cache_before);
+                let memory_after_view = net.device.memory_pool_usage().map(|u| serde_json::json!({
+                    "reserved_bytes":u.bytes_reserved,"in_use_bytes":u.bytes_in_use,
+                    "padding_bytes":u.bytes_padding,"allocations":u.number_allocs
+                }));
                 std::fs::write(
                     out.join("metadata.json"),
                     serde_json::to_vec_pretty(
-                        &serde_json::json!({"width":normal.w,"height":normal.h,"formats":save_formats.names(),"normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip","input_channels":"BGR","files":input.files,"model":model,"seconds":start.elapsed().as_secs_f64(),"precision":format!("{dtype:?}"),"api":effective_api,"encoder_batch":effective_encoder_batch,"pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,"score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,"optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,"pool_cache_mib":cli.pool_cache_mib,"burn":"0.22.0","crop_policy":"upstream exclusive maxima"}),
+                        &serde_json::json!({
+                            "width":normal.w,"height":normal.h,"formats":save_formats.names(),
+                            "normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip",
+                            "input_channels":"BGR","files":input.files,"model":model,"seconds":view_seconds,
+                            "inference_seconds":inference_seconds,"output_seconds":view_seconds-inference_seconds,
+                            "precision":format!("{dtype:?}"),"api":effective_api,"encoder_batch":effective_encoder_batch,
+                            "pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,
+                            "score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,
+                            "optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,
+                            "pool_cache_mib":cli.pool_cache_mib,"burn":"0.22.0","cubecl":"0.11.0","cubek":"0.3.0",
+                            "images":input.images.len(),"padded_size":input.size,"cache_build_id":build_id(),
+                            "cache_mode":cache_mode.name(),"kernel_cache_dir":cache_dir,"cache_diagnostics":cli.cache_diagnostics,
+                            "preparation_seconds":preparation_seconds,"preparation_cache":preparation_cache,
+                            "view_cache":view_cache,"memory_after_view":memory_after_view,"crop_policy":"upstream exclusive maxima"
+                        }),
                     )?,
                 )?;
                 println!(
                     "Saved normals to {} ({:.2}s)",
                     out.display(),
-                    start.elapsed().as_secs_f64()
+                    view_seconds
                 );
                 unimsps::trace::write_report(&out.join("timing_trace.json"),serde_json::json!({
                     "images":input.images.len(),"padded_size":input.size,"queue_depth":cli.queue_depth,
                     "score_budget_mib":cli.score_budget_mib,"pool_cache_mib":cli.pool_cache_mib,
                     "encoder_batch":effective_encoder_batch,"precision":format!("{dtype:?}"),"api":effective_api,
-                    "kernel_cache_dir":cache_dir,"persistent_cache_enabled":!cli.no_kernel_cache && !cli.cpu,
+                    "kernel_cache_dir":cache_dir,"persistent_cache_enabled":persistent_cache,"cache_mode":cache_mode.name(),
                     "device":format!("{:?}",net.device.identity())}))?;
                 unimsps::profile::write_report(&out.join("profile.json"), serde_json::json!({
                     "device": format!("{:?}", net.device.identity()), "api": effective_api,
@@ -413,7 +455,8 @@ fn main() -> Result<()> {
             );
         }
     }
-    if !cli.no_kernel_cache && !cli.cpu { checkpoint_and_report("exit"); }
+    if persistent_cache { checkpoint_and_report("exit"); }
+    report_reuse("exit");
     let total_secs = program_start.elapsed().as_secs_f64();
     eprintln!("Total run time: {total_secs:.2}s");
     println!("Total run time: {total_secs:.2}s");

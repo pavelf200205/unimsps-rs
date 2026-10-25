@@ -28,22 +28,6 @@ use turso::transaction::TransactionBehavior;
 use super::{InsertSummary, Insertion, NamespaceSummary, Origin, Storage};
 use crate::bytes::Bytes;
 use crate::sync::{LazyLock, Mutex};
-use core::sync::atomic::{AtomicBool, Ordering};
-
-static FREEZE_WRITES: AtomicBool = AtomicBool::new(false);
-
-/// Freeze or unfreeze durable SQLite writes.
-/// Freezing writes after startup warmup prevents noisy mid-batch autotune benchmarks
-/// (recorded while the GPU is under full 512x512 / 1024x1024 memory load) from
-/// polluting the persistent cache across subsequent runs.
-pub fn set_freeze_writes(freeze: bool) {
-    FREEZE_WRITES.store(freeze, Ordering::Relaxed);
-}
-
-/// Whether durable SQLite writes are currently frozen.
-pub fn writes_frozen() -> bool {
-    FREEZE_WRITES.load(Ordering::Relaxed)
-}
 
 /// The database schema this build reads and writes. A file carrying any other
 /// version has its entries table dropped and rebuilt: it is a cache, so the
@@ -118,25 +102,6 @@ enum DatabaseState {
 static DATABASES: LazyLock<Mutex<HashMap<String, DatabaseState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Shared connection per active database location so that all stores and
-/// `wal_checkpoint(TRUNCATE)` operate on the same `turso::Connection` without
-/// multi-connection WAL lock contention on Windows.
-static SHARED_CONNECTIONS: LazyLock<Mutex<HashMap<String, Arc<Mutex<turso::Connection>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn shared_connection(
-    location: &str,
-    database: &turso::Database,
-) -> Result<Arc<Mutex<turso::Connection>>, String> {
-    let mut map = SHARED_CONNECTIONS.lock();
-    if let Some(conn) = map.get(location) {
-        return Ok(conn.clone());
-    }
-    let conn = Arc::new(Mutex::new(connect(database).map_err(error)?));
-    map.insert(location.to_string(), conn.clone());
-    Ok(conn)
-}
-
 /// What [`Database::scan_with_origin`] calls per entry: its key, its value, and
 /// where it came from.
 type OriginVisitor<'a> = dyn FnMut(&[u8], &[u8], Origin) + 'a;
@@ -144,15 +109,39 @@ type OriginVisitor<'a> = dyn FnMut(&[u8], &[u8], Origin) + 'a;
 /// How a database opened at a path ([`Database::open_at`]) may be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
+    /// Read and never written: not migrated, not checkpointed, and refused
+    /// unless the file is an environment at this build's schema version.
+    /// Safe to point at a file another process is writing, and at one in a
+    /// directory nobody may write.
+    ///
+    /// The engine keeps one database object per file for the whole process,
+    /// configured by the first open: while a read-only handle lives, every
+    /// other open of that file in the process is read-only too, including the
+    /// stores of an environment activated on it meanwhile, for as long as they
+    /// live. The active environment's own file is the exception: a read-only
+    /// handle to it shares the active environment's database rather than
+    /// downgrading it.
     ReadOnly,
+    /// Read and written, and brought to this build's schema on open exactly
+    /// as the active environment's database is: a file of another schema has
+    /// its entries dropped.
     ReadWrite,
 }
 
+/// Every namespace of an environment's database file at once: the active
+/// environment's ([`open_active`](Self::open_active)), or any other
+/// ([`open_at`](Self::open_at)).
+///
+/// A [`TursoStorage`] is this bound to one namespace. The records of a build
+/// ([`crate::records`]) span namespaces — the sessions', and one per record
+/// kind — and are read and written through this instead.
 pub struct Database {
-    /// Shared across handles to the active environment's database so
-    /// `wal_checkpoint(TRUNCATE)` never contends with open store connections.
-    connection: Arc<Mutex<turso::Connection>>,
+    /// The engine rejects concurrent use of a connection at runtime rather
+    /// than serializing it, so each handle holds one and takes it in turn.
+    connection: Mutex<turso::Connection>,
     location: String,
+    /// Read by [`into_standalone`](Self::into_standalone), which only a file
+    /// system has.
     #[cfg_attr(browser_cache, expect(dead_code, reason = "native only"))]
     access: Access,
 }
@@ -169,18 +158,27 @@ impl core::fmt::Debug for Database {
 impl Database {
     /// A connection to the active environment's database.
     fn open() -> Result<Self, String> {
+        if super::persistence_policy() == super::PersistencePolicy::Memory {
+            return Err("database disabled by memory-only persistence policy".into());
+        }
         let location = location()?;
         let database = database()?;
-        let connection = shared_connection(&location, &database)?;
+        let connection = connect(&database).map_err(error)?;
 
         Ok(Self {
-            connection,
+            connection: Mutex::new(connection),
             location,
             access: Access::ReadWrite,
         })
     }
 
+    /// The active environment's database, or `None` when it can't be opened:
+    /// a read-only mount, a missing parent directory, a browser page that
+    /// hasn't awaited [`crate::environment::open`]. Callers go without
+    /// rather than fail.
     pub fn open_active() -> Option<Self> {
+        // Runtime records bypass Storage; neither restricted mode persists them.
+        if super::persistence_policy() != super::PersistencePolicy::All { return None; }
         match Self::open() {
             Ok(database) => Some(database),
             Err(error) => {
@@ -190,29 +188,44 @@ impl Database {
         }
     }
 
+    /// The environment database file at `path`, whichever environment is
+    /// active: a saved environment, one a build ran in, another process's.
+    ///
+    /// The engine shares one database object per file across the process, so
+    /// opening a file a store of the active environment already has open is
+    /// the same database, not a second writer beside it. The active
+    /// environment's own file is opened as its stores open it, whatever
+    /// `access` asks: a read-only open there would leave its stores unable to
+    /// write.
+    ///
+    /// # Errors
+    ///
+    /// When `path` is not UTF-8, when the file can't be opened with `access`,
+    /// and, read-only, when it is missing or is not an environment at this
+    /// build's schema.
     #[cfg(native_cache)]
     pub fn open_at(path: &std::path::Path, access: Access) -> Result<Self, String> {
+        if super::persistence_policy() == super::PersistencePolicy::Memory {
+            return Err("database disabled by memory-only persistence policy".into());
+        }
         let active = location()
             .ok()
             .filter(|active| same_file(path, std::path::Path::new(active)));
-        if let Some(active) = active {
+        let (location, database) = if let Some(active) = active {
             let database = crate::future::block_on(shared_database(&active))?;
-            let connection = shared_connection(&active, &database)?;
-            return Ok(Self {
-                connection,
-                location: active,
-                access,
-            });
-        }
-        let location = path
-            .to_str()
-            .ok_or_else(|| format!("database path {path:?} is not valid UTF-8"))?
-            .to_string();
-        let database = crate::future::block_on(open_at_path(&location, access))?;
-        let connection = Arc::new(Mutex::new(connect(&database).map_err(error)?));
+            (active, database)
+        } else {
+            let location = path
+                .to_str()
+                .ok_or_else(|| format!("database path {path:?} is not valid UTF-8"))?
+                .to_string();
+            let database = crate::future::block_on(open_at_path(&location, access))?;
+            (location, Arc::new(database))
+        };
+        let connection = connect(&database).map_err(error)?;
 
         Ok(Self {
-            connection,
+            connection: Mutex::new(connection),
             location,
             access,
         })
@@ -244,7 +257,9 @@ impl Database {
 
     /// The value stored under `key` in `namespace`.
     pub fn get(&self, namespace: &str, key: &[u8]) -> Option<Bytes> {
-        self.run("read", namespace, |connection| {
+        #[cfg(std_io)]
+        let started = std::time::Instant::now();
+        let value = self.run("read", namespace, |connection| {
             let mut rows = drive(connection.query(SELECT, (namespace, key.to_vec())))?;
             let Some(row) = drive(rows.next())? else {
                 return Ok(None);
@@ -252,26 +267,29 @@ impl Database {
             let value: Vec<u8> = row.get(0)?;
             Ok(Some(Bytes::from_bytes_vec(value)))
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+        #[cfg(std_io)]
+        super::cache_policy::record_read(namespace, value.is_some(), started.elapsed());
+        value
     }
 
     /// Stores `value` under `key`. See [`Storage`] for the rules; in short, a
     /// local value replaces an imported one and nothing else overwrites.
     pub fn insert(&self, namespace: &str, key: &[u8], value: &[u8], origin: Origin) -> Insertion {
-        if writes_frozen() {
-            return Insertion::Stored;
-        }
-        self.run("write", namespace, |connection| {
+        #[cfg(std_io)]
+        let started = std::time::Instant::now();
+        let result = self.run("write", namespace, |connection| {
             insert_on(connection, namespace, key, value, origin)
         })
-        .unwrap_or_else(Insertion::Failed)
+        .unwrap_or_else(Insertion::Failed);
+        #[cfg(std_io)]
+        super::cache_policy::record_write(namespace, matches!(&result, Insertion::Stored),
+            matches!(&result, Insertion::Failed(_)), started.elapsed());
+        result
     }
 
     /// Stores `value` under `key`, overwriting whatever is there.
     pub fn replace(&self, namespace: &str, key: &[u8], value: &[u8], origin: Origin) -> Insertion {
-        if writes_frozen() {
-            return Insertion::Stored;
-        }
         self.run("replace", namespace, |connection| {
             let params = (namespace, key.to_vec(), value.to_vec(), origin_code(origin));
             drive(connection.execute(REPLACE, params))?;
@@ -289,12 +307,6 @@ impl Database {
         entries: &mut dyn Iterator<Item = (Bytes, Bytes)>,
         origin: Origin,
     ) -> InsertSummary {
-        if writes_frozen() {
-            return InsertSummary {
-                stored: entries.count(),
-                ..InsertSummary::default()
-            };
-        }
         let mut connection = self.connection.lock();
         let transaction = match drive(connection.transaction_with_behavior(write_transaction())) {
             Ok(transaction) => transaction,
@@ -370,8 +382,7 @@ impl Database {
             .unwrap_or_default()
     }
 
-    /// Flush committed cache entries from the WAL into the main database file.
-    /// Does not change journal mode or close live cache connections.
+    /// Fold committed WAL data into the main file without closing live stores.
     #[cfg(native_cache)]
     pub fn checkpoint(&self) -> Result<bool, String> {
         checkpoint(&self.connection.lock()).map_err(error)
@@ -429,10 +440,7 @@ impl Database {
                 "{location} is open as an environment's database in this process"
             ));
         }
-        let conn = Arc::try_unwrap(connection)
-            .map_err(|_| format!("{location} still has open connections in this process"))?
-            .into_inner();
-        make_standalone(conn, std::path::Path::new(&location))
+        make_standalone(connection.into_inner(), std::path::Path::new(&location))
     }
 
     /// The names of every namespace this database holds.
@@ -711,10 +719,9 @@ async fn open_database(location: &str) -> Result<turso::Database, turso::Error> 
             .map_err(|error| turso::Error::IoError(error.kind(), "creating the cache directory"))?;
     }
 
-    // Uni-MS-PS local patch: Turso's default WindowsIO has no shared-WAL
-    // coordination primitives. Use its normal locked database mode on Windows;
-    // leave supported Unix multiprocess WAL unchanged.
     turso::Builder::new_local(location)
+        // Turso 0.8.3 WindowsIO does not implement shared-WAL coordination.
+        // Ordinary database file locking remains enabled.
         .experimental_multiprocess_wal(!cfg!(target_os = "windows"))
         .build()
         .await

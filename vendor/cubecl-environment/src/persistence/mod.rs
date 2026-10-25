@@ -18,6 +18,11 @@ pub mod storage;
 
 pub use storage::*;
 
+mod cache_policy;
+pub use cache_policy::{PersistencePolicy, persistence_policy, set_persistence_policy};
+#[cfg(std_io)]
+pub use cache_policy::{ShaderCacheStats, shader_cache_stats};
+
 mod namespace;
 mod store;
 
@@ -30,7 +35,7 @@ pub use store::*;
 pub(crate) mod turso;
 
 #[cfg(any(native_cache, browser_cache))]
-pub use turso::{Access, Database, TursoStorage, set_freeze_writes, writes_frozen};
+pub use turso::{Access, Database, TursoStorage};
 
 #[cfg(browser_cache)]
 mod turso_browser;
