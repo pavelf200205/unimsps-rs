@@ -53,11 +53,15 @@ pub fn configure_runtime(cache_dir: &Path, mode: CacheMode, diagnostics: Option<
     config.environment.name = format!("unimsps-{}",build_id());
     if let Some(dir) = diagnostics {
         std::fs::create_dir_all(dir)?;
+        // Reset once before runtime initialization. Independent logger sinks
+        // must append: append=false opens at offset zero without truncation.
+        std::fs::write(dir.join("compilation.log"), b"")?;
+        std::fs::write(dir.join("autotune.jsonl"), b"")?;
         config.compilation.logger.level = cubecl::config::compilation::CompilationLogLevel::Basic;
         config.compilation.logger.file = Some(dir.join("compilation.log"));
-        config.compilation.logger.append = false;
+        config.compilation.logger.append = true;
         config.autotune.decisions.file = Some(dir.join("autotune.jsonl"));
-        config.autotune.decisions.append = false;
+        config.autotune.decisions.append = true;
         eprintln!("Cache diagnostic logs: {}", dir.display());
     }
     anyhow::ensure!(CubeClRuntimeConfig::try_set(config), "CubeCL was initialized before cache configuration");

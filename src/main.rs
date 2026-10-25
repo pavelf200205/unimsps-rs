@@ -11,6 +11,7 @@ use unimsps::{
 
 #[derive(Parser)]
 #[command(about = "Uni-MS-PS normal estimation using Burn 0.22")]
+#[command(version = env!("UNIMSPS_GIT_REVISION"))]
 struct Cli {
     /// Detailed synchronized CPU/GPU wall timings; writes profile.json. Slows execution.
     #[arg(long, short = 'v', global = true)]
@@ -123,7 +124,7 @@ enum Command {
 fn main() -> Result<()> {
     let program_start = std::time::Instant::now();
     let cli = Cli::parse();
-    eprintln!("unimsps (shader-only persistence; Burn 0.22.0 / CubeCL 0.11.0)");
+    eprintln!("unimsps {} (shader-only persistence; Burn 0.22.0 / CubeCL 0.11.0)", env!("UNIMSPS_GIT_REVISION"));
     unimsps::profile::configure(cli.verbose);
     unimsps::trace::configure(cli.trace_performance);
     unimsps::trace::configure_gpu(cli.trace_gpu);
@@ -312,7 +313,7 @@ fn main() -> Result<()> {
                 std::fs::write(dir.join("preparation.json"), serde_json::to_vec_pretty(&serde_json::json!({
                     "seconds":preparation_seconds,"cache":preparation_cache,
                     "process_totals":cache_delta(Default::default()),"cache_mode":cache_mode.name(),
-                    "cache_build_id":build_id(),"kernel_cache_dir":cache_dir,"images":warmup_lights,
+                    "cache_build_id":build_id(),"git_revision":env!("UNIMSPS_GIT_REVISION"),"kernel_cache_dir":cache_dir,"images":warmup_lights,
                     "encoder_batch":effective_encoder_batch,"precision":format!("{dtype:?}"),
                     "warmup_enabled":!cli.no_warmup && !cli.cpu,"previous_workload_marker":was_warmed
                 }))?)?;
@@ -372,7 +373,7 @@ fn main() -> Result<()> {
                             "score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,
                             "optimized_encoder":!cli.reference_encoder,"gemm_convolutions":!cli.burn_convolutions,
                             "pool_cache_mib":cli.pool_cache_mib,"burn":"0.22.0","cubecl":"0.11.0","cubek":"0.3.0",
-                            "images":input.images.len(),"padded_size":input.size,"cache_build_id":build_id(),
+                            "images":input.images.len(),"padded_size":input.size,"cache_build_id":build_id(),"git_revision":env!("UNIMSPS_GIT_REVISION"),
                             "cache_mode":cache_mode.name(),"kernel_cache_dir":cache_dir,"cache_diagnostics":cli.cache_diagnostics,
                             "preparation_seconds":preparation_seconds,"preparation_cache":preparation_cache,
                             "view_cache":view_cache,"memory_after_view":memory_after_view,"crop_policy":"upstream exclusive maxima"

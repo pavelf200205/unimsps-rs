@@ -17,6 +17,27 @@ fn hash_part(hash: &mut u64, bytes: &[u8]) {
 }
 
 fn main() {
+    // Track Git separately from the shader identity: a documentation-only commit
+    // changes the executable label without invalidating compiled shaders.
+    let git = |args: &[&str]| -> Option<String> {
+        let output = Command::new("git").args(args).output().ok()?;
+        output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    for name in ["HEAD", "index", "packed-refs"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", name]) {
+            if Path::new(&path).exists() { println!("cargo:rerun-if-changed={path}"); }
+        }
+    }
+    if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git(&["rev-parse", "--git-path", &reference]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    let mut revision = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    if git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty()) {
+        revision.push_str("-dirty");
+    }
+    println!("cargo:rustc-env=UNIMSPS_GIT_REVISION={revision}");
     let mut files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock"), PathBuf::from("build.rs"),
         PathBuf::from("vendor/cubecl-environment/Cargo.toml"), PathBuf::from("vendor/cubecl-environment/build.rs")];
     collect(Path::new("src"), &mut files);
