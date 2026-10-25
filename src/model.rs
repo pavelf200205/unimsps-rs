@@ -507,11 +507,20 @@ impl Model {
         );
         let depthwise_profile = crate::profile::span(&self.device, || format!("mlp/depthwise-gelu {p} input={:?}", z.dims()));
         let dw = format!("{p}.mlp.dwconv.dwconv");
-        let fused = if self.options.optimized_encoder {
-            crate::depthwise::forward(z.clone(), self.w4(&format!("{dw}.weight")), self.w1(&format!("{dw}.bias")), h, w)
-        } else { None };
-        let z = if let Some(out) = fused {
-            out
+        let z = if self.options.optimized_encoder {
+            match crate::depthwise::forward(
+                z,
+                self.w4(&format!("{dw}.weight")),
+                self.w1(&format!("{dw}.bias")),
+                h,
+                w,
+            ) {
+                Ok(out) => out,
+                Err(z) => {
+                    let conv = self.conv(z.swap_dims(1, 2).reshape([b, 4 * c, h, w]), &dw, 1, 1, 4 * c);
+                    activation::gelu(conv.reshape([b, 4 * c, n]).swap_dims(1, 2))
+                }
+            }
         } else {
             let conv = self.conv(z.swap_dims(1, 2).reshape([b, 4 * c, h, w]), &dw, 1, 1, 4 * c);
             activation::gelu(conv.reshape([b, 4 * c, n]).swap_dims(1, 2))
@@ -564,14 +573,17 @@ impl Model {
         let mut out = if b > batch_limit {
             Some(Tensor::empty([b, out_n, c], self.tensor_options()))
         } else { None };
+        let mut x_opt = Some(x);
         for (chunk, start) in (0..b).step_by(batch_limit).enumerate() {
             let end = (start + batch_limit).min(b);
             let valid_pixels = end - start;
             let work_pixels = static_bucket_size(valid_pixels, batch_limit);
             let mut z = if start == 0 && end == b {
-                x.clone()
+                x_opt.take().unwrap()
+            } else if end == b {
+                x_opt.take().unwrap().slice([start..end, 0..n, 0..c])
             } else {
-                x.clone().slice([start..end, 0..n, 0..c])
+                x_opt.as_ref().unwrap().clone().slice([start..end, 0..n, 0..c])
             };
             if work_pixels > valid_pixels {
                 z = Tensor::cat(vec![z, Tensor::zeros([work_pixels - valid_pixels, n, c], self.tensor_options())], 0);
@@ -672,8 +684,8 @@ impl Model {
             }
         }
 
-        // 5. Ensure all pipeline shader compilations and autotunings complete and release warmup buffers
-        crate::execution::cleanup_view(&self.device);
+        // 5. Ensure all pipeline shader compilations and autotunings complete and release warmup slabs
+        crate::execution::purge_pool(&self.device);
         Ok(())
     }
 
@@ -837,11 +849,22 @@ impl Model {
             let x = encoded.permute([1, 0, 2]);
             // `pool_block` outputs only enter the local convolutional U-Net decoder, so gathering
             // the exact decoder backward cone `active_mask` is 100% lossless (0.0 error on kept pixels).
-            let x_pool = if let Some(ref mask) = active_mask {
-                crate::remap::forward(x.clone(),mask.gather_idx.clone())
-                    .unwrap_or_else(||x.clone().select(0,mask.gather_idx.clone()))
+            let (x_pool, x_light) = if i < 3 {
+                let xp = if let Some(ref mask) = active_mask {
+                    crate::remap::forward(x.clone(), mask.gather_idx.clone())
+                        .unwrap_or_else(|| x.clone().select(0, mask.gather_idx.clone()))
+                } else {
+                    x.clone()
+                };
+                (xp, Some(x))
             } else {
-                x.clone()
+                let xp = if let Some(ref mask) = active_mask {
+                    crate::remap::forward(x.clone(), mask.gather_idx.clone())
+                        .unwrap_or_else(|| x.select(0, mask.gather_idx.clone()))
+                } else {
+                    x
+                };
+                (xp, None)
             };
             drop(gather_profile);
             let pool = self
@@ -854,7 +877,7 @@ impl Model {
                 // `light_block` feeds into subsequent encoder stages (`block2`, `block3`, `block4`)
                 // which perform global spatial self-attention over all spatial tokens in the patch.
                 images_opt = Some(
-                    self.set_layer(x, &format!("{root}.light_block{}", i + 1), false)
+                    self.set_layer(x_light.unwrap(), &format!("{root}.light_block{}", i + 1), false)
                         .permute([1, 2, 0])
                         .reshape([lights, c, oh, ow]),
                 );

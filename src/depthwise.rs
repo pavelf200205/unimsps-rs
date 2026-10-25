@@ -76,18 +76,45 @@ impl Operation<FusionCubeRuntime> for DepthwiseOp {
     }
 }
 
-pub(crate) fn forward(x: BurnTensor<3>, weight: BurnTensor<4>, bias: BurnTensor<1>, height: usize, width: usize) -> Option<BurnTensor<3>> {
+pub(crate) fn forward(
+    x: BurnTensor<3>,
+    weight: BurnTensor<4>,
+    bias: BurnTensor<1>,
+    height: usize,
+    width: usize,
+) -> Result<BurnTensor<3>, BurnTensor<3>> {
     let [_, tokens, channels] = x.dims();
-    if tokens != height * width || weight.dims() != [channels, 1, 3, 3] || bias.dims() != [channels] { return None; }
-    let x = x.inner().try_into_primitive::<Gpu>().ok()?;
-    let weight = weight.inner().try_into_primitive::<Gpu>().ok()?;
-    let bias = bias.inner().try_into_primitive::<Gpu>().ok()?;
-    let client = x.client.clone();
-    let compute = client.device().client();
+    if tokens != height * width || weight.dims() != [channels, 1, 3, 3] || bias.dims() != [channels] {
+        return Err(x);
+    }
+    let Ok(x_prim) = x.inner().try_into_primitive::<Gpu>() else {
+        unreachable!("CubeBackend tensor expected");
+    };
+    let compute = x_prim.client.device().client();
     let hw = &compute.properties().hardware;
-    if hw.max_units_per_cube < 128 || hw.max_cube_dim.0 < 128 { return None; }
-    let output = TensorIr::uninit(client.create_empty_handle(), x.shape.clone(), x.dtype);
-    let desc = CustomOpIr::with_scalars("unimsps_token_depthwise", &[x.into_ir(), weight.into_ir(), bias.into_ir()], &[output], vec![]);
-    let [out] = client.register(StreamId::current(), OperationIr::Custom(desc.clone()), DepthwiseOp { desc, height, width }).outputs();
-    Some(BurnTensor::from_primitive::<Gpu>(out))
+    if hw.max_units_per_cube < 128 || hw.max_cube_dim.0 < 128 {
+        return Err(BurnTensor::from_primitive::<Gpu>(x_prim));
+    }
+    let Ok(weight) = weight.inner().try_into_primitive::<Gpu>() else {
+        return Err(BurnTensor::from_primitive::<Gpu>(x_prim));
+    };
+    let Ok(bias) = bias.inner().try_into_primitive::<Gpu>() else {
+        return Err(BurnTensor::from_primitive::<Gpu>(x_prim));
+    };
+    let client = x_prim.client.clone();
+    let output = TensorIr::uninit(client.create_empty_handle(), x_prim.shape.clone(), x_prim.dtype);
+    let desc = CustomOpIr::with_scalars(
+        "unimsps_token_depthwise",
+        &[x_prim.into_ir(), weight.into_ir(), bias.into_ir()],
+        &[output],
+        vec![],
+    );
+    let [out] = client
+        .register(
+            StreamId::current(),
+            OperationIr::Custom(desc.clone()),
+            DepthwiseOp { desc, height, width },
+        )
+        .outputs();
+    Ok(BurnTensor::from_primitive::<Gpu>(out))
 }

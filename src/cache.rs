@@ -51,8 +51,6 @@ pub fn configure_runtime(cache_dir: &Path, enabled: bool) {
         let _ = std::fs::create_dir_all(&driver_cuda_dir);
         let _ = std::fs::create_dir_all(&driver_mesa_dir);
 
-        // Configure 2 GiB driver shader cache quotas and disable automatic cleanup
-        // so compiled Vulkan / CUDA / Mesa pipelines are not evicted between runs.
         set_env_if_absent("__GL_SHADER_DISK_CACHE", "1");
         set_env_if_absent("__GL_SHADER_DISK_CACHE_PATH", &driver_gl_dir);
         set_env_if_absent("__GL_SHADER_DISK_CACHE_SIZE", "2147483648");
@@ -65,10 +63,16 @@ pub fn configure_runtime(cache_dir: &Path, enabled: bool) {
         set_env_if_absent("MESA_SHADER_CACHE_DIR", &driver_mesa_dir);
         set_env_if_absent("MESA_SHADER_CACHE_MAX_SIZE", "2G");
     }
+    cubecl_environment::records::configure(cubecl_environment::records::RecordsConfig {
+        level: cubecl_environment::records::RecordLevel::Off,
+        keep_sessions: Some(0),
+    });
     let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
     config.compilation.cache = enabled;
     config.autotune.disable_cache = !enabled;
     config.throughput.disable_cache = !enabled;
+    config.environment.records.level = cubecl_environment::records::RecordLevel::Off;
+    config.environment.records.keep_sessions = Some(0);
     config.environment.path = CacheConfig::Directory(cache_dir.join("runtime"));
     config.environment.name = format!("unimsps-{}",build_id());
     if !CubeClRuntimeConfig::try_set(config) {

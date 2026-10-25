@@ -551,7 +551,6 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                         vec![images, prior.repeat_dim(0, lights)],
                         1,
                     );
-                    crate::execution::finish(&model.device);
                     (None, None, Some(full))
                 }
                 ImageLevel::Host(host_imgs) => (Some(host_imgs), Some(prior), None),
@@ -643,7 +642,6 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     }
                     submitted += 1;
                     crate::execution::checkpoint_patch(&model.device, submitted);
-                    crate::execution::trim_memory(&model.device);
                     if let Some(mut trace)=patch_trace { trace.mark("completion_wait");trace.finish(&model.device,submitted); }
                     eprintln!("  Patch {count}/{total} {}", if crate::execution::depth() != 0 || crate::profile::enabled() { "completed" } else { "queued" });
                 }

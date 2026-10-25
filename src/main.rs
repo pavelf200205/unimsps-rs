@@ -40,7 +40,8 @@ struct Cli {
     /// Spatial attention query limit; 0 uses full chunk budget. Unfused scores remain bounded.
     #[arg(long, default_value_t = 0, global = true)]
     query_batch: usize,
-    #[arg(long, default_value_t = 8, global = true)]
+    /// Images processed together by the spatial encoder (default: 16 so 6-16 light runs execute in one pass).
+    #[arg(long, default_value_t = 16, global = true)]
     encoder_batch: usize,
     /// Auto selects FP16 on supporting GPUs, FP32 on CPU/other adapters.
     #[arg(long, default_value = "auto", value_parser = ["auto", "fp16", "fp32"], global = true)]
@@ -266,10 +267,11 @@ fn main() -> Result<()> {
                 net.options.pixel_batch,warmup_lights,net.options.query_batch,net.options.score_budget_mib,
                 net.options.fused_attention,net.options.fused_softmax,net.options.optimized_encoder,net.options.gemm_convolutions,
             );
+            let was_warmed = !cli.no_kernel_cache && kernel_cache.is_warmed(&cache_signature);
             if !cli.no_warmup && !cli.cpu {
-                if !cli.no_kernel_cache && kernel_cache.is_warmed(&cache_signature) {
+                if was_warmed {
                     eprintln!(
-                        "Using persisted CubeCL autotune & shader cache for {warmup_lights} lights (skipping redundant 36-pass warmup replay)."
+                        "Using persisted CubeCL autotune & shader cache for {warmup_lights} lights."
                     );
                 } else {
                     eprintln!("Warming kernels and autotuning for {warmup_lights} lights (first use may be slow)...");
@@ -278,6 +280,7 @@ fn main() -> Result<()> {
                     drop(warmup_profile);
                     if !cli.no_kernel_cache {
                         kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
+                        checkpoint_and_report("after preparation");
                     }
                     eprintln!("Kernel warmup complete; normal inference executes on the GPU.");
                 }
@@ -315,6 +318,9 @@ fn main() -> Result<()> {
                 drop(save_profile);
                 if obj_idx == 0 && !cli.no_kernel_cache && !cli.cpu {
                     kernel_cache.record_and_save(&cache_dir, Some(cache_signature.clone()));
+                    if !was_warmed {
+                        checkpoint_and_report("after first view");
+                    }
                 }
                 std::fs::write(
                     out.join("metadata.json"),
