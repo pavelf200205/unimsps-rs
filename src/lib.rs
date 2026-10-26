@@ -12,7 +12,6 @@ mod depthwise;
 
 mod conv_gemm;
 
-pub mod cache;
 mod remap;
 
 pub mod trace;

@@ -225,14 +225,24 @@ convolution dispatch for these layers and skips the extra packed weights.
 Use normal runs to compare throughput and --verbose separately to inspect
 conv-pack and conv-matmul costs. This source change has not been built or timed.
 
-## Persistent preparation update
+## Runtime preparation and build identification
 
-The default `--cache-mode shaders` persists compiled shader artifacts only.
-Autotuning and hardware-throughput measurements are reused in memory within
-each process. `--cache-mode memory` (or `--no-kernel-cache`) also disables shader
-persistence while preserving all in-process reuse.
+Shaders, tuning decisions and throughput measurements are reused only within
+one process. Cross-run persistence and the local CubeCL fork have been removed.
+Warmup runs at startup; no cache flags or cache directory are needed. Ordinary
+in-process pipeline reuse, allocator pooling and image caching remain enabled.
 
-`--cache-diagnostics` writes compilation/autotuning logs into `OUT/_runtime`.
-Preparation and view metadata include actual shader database hit/miss counters.
-See [CACHE_AND_SCHEDULING.md](CACHE_AND_SCHEDULING.md) for the cache design,
-the reason for the small local dependency patch, and exact manual run commands.
+CubeCL 0.11.0's Vulkan dependencies still enable its internal persistence feature
+transitively. The application disables shader persistence, autotune persistence
+and runtime records. For throughput measurements (which have no memory-only
+configuration switch), it uses upstream's memory fallback by setting the storage
+root to the existing executable file. That file cannot be a directory: upstream
+directory creation fails before opening any database, and selects MemoryStorage.
+The executable is not modified. This small configuration workaround avoids a
+vendored crate while retaining process-local throughput reuse. The database
+dependencies remain transitive, but no application cache database is used.
+
+Build manually with `./tools/build_release.ps1` to preserve a commit-labelled
+executable beside Cargo's standard binary. No build or inference is launched by
+editing these sources. The preserved `unimsps_853268e.exe` uses the old CLI and
+still requires `--cache-mode memory` for the known-good configuration.
