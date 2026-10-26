@@ -21,7 +21,7 @@ fn main() {
         revision.push_str("-dirty");
     }
     println!("cargo:rustc-env=UNIMSPS_GIT_REVISION={revision}");
-    for path in ["src", "Cargo.toml", "Cargo.lock", "build.rs", "tools/build_release.ps1"] {
+    for path in ["src", "vendor/cubecl-environment/src", "Cargo.toml", "Cargo.lock", "build.rs", "tools/build_release.ps1"] {
         println!("cargo:rerun-if-changed={path}");
     }
 }

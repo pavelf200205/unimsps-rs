@@ -191,7 +191,7 @@ requirements automatically retain that implementation. Latest source changes
 have not been compiled or timed here. FP32 reductions may change FP16 rounding.
 
 `--pool-cache-mib N` controls the allocator reservation threshold that triggers
-cleanup. The current default is 1024 MiB of total pool reservation. Larger values can retain
+cleanup. The existing 1536 MiB default is unchanged. Larger values can retain
 more reusable buffers at the cost of higher reserved VRAM; 0 disables these
 explicit cleanup calls. This is a cleanup trigger, not a hard VRAM limit.
 
@@ -225,24 +225,9 @@ convolution dispatch for these layers and skips the extra packed weights.
 Use normal runs to compare throughput and --verbose separately to inspect
 conv-pack and conv-matmul costs. This source change has not been built or timed.
 
-## Runtime preparation and build identification
+## Persistent preparation update
 
-Shaders, tuning decisions and throughput measurements are reused only within
-one process. Cross-run persistence and the local CubeCL fork have been removed.
-Warmup runs at startup; no cache flags or cache directory are needed. Ordinary
-in-process pipeline reuse, allocator pooling and image caching remain enabled.
-
-CubeCL 0.11.0's Vulkan dependencies still enable its internal persistence feature
-transitively. The application disables shader persistence, autotune persistence
-and runtime records. For throughput measurements (which have no memory-only
-configuration switch), it uses upstream's memory fallback by setting the storage
-root to the existing executable file. That file cannot be a directory: upstream
-directory creation fails before opening any database, and selects MemoryStorage.
-The executable is not modified. This small configuration workaround avoids a
-vendored crate while retaining process-local throughput reuse. The database
-dependencies remain transitive, but no application cache database is used.
-
-Build manually with `./tools/build_release.ps1` to preserve a commit-labelled
-executable beside Cargo's standard binary. No build or inference is launched by
-editing these sources. The preserved `unimsps_853268e.exe` uses the old CLI and
-still requires `--cache-mode memory` for the known-good configuration.
+See [CACHE_AND_SCHEDULING.md](CACHE_AND_SCHEDULING.md) for the current cache,
+compile-only startup replay, sparse remapping and queue/memory policies. This
+supersedes earlier claims that a workload marker can skip all warmup. A rebuild
+is required to enable the Vulkan compiler and runtime persistence features.

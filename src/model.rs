@@ -647,46 +647,56 @@ impl Model {
     pub fn warmup(&self, lights: usize) -> Result<()> {
         let lights = lights.max(1);
 
-        // 1. Warm Net_first (32x32 global coarse stage)
+        // 1. Warm Net_first (32x32 global coarse stage) and immediately release slabs
         let dummy_first = Tensor::zeros([lights, 3, 32, 32], self.tensor_options());
         let mask32 = vec![true; 32 * 32];
-        let _ = self.forward_masked(dummy_first, false, Some(&mask32))?;
+        let out_first = self.forward_masked(dummy_first, false, Some(&mask32))?;
+        drop(out_first);
+        crate::execution::purge_pool(&self.device);
 
-        // 2. Warm intermediate scales (64x64, 128x128)
+        // 2. Warm intermediate scales (64x64, 128x128), purging after each scale so
+        // temporary autotune/benchmark allocations never accumulate across scales.
         for &sz in &[64, 128] {
             let dummy = Tensor::zeros([lights, 6, sz, sz], self.tensor_options());
             let mask = vec![true; sz * sz];
-            let _ = self.forward_masked(dummy, true, Some(&mask))?;
+            let out_mid = self.forward_masked(dummy, true, Some(&mask))?;
+            drop(out_mid);
+            crate::execution::purge_pool(&self.device);
         }
-
-        crate::execution::purge_pool(&self.device);
 
         // 3. Warm dense Net_stage (full 256x256 patch; sparse buckets are warmed explicitly below)
         let dummy_stage = Tensor::zeros([lights, 6, 256, 256], self.tensor_options());
-        let _ = self.forward_masked(dummy_stage, true, None)?;
+        let out_stage = self.forward_masked(dummy_stage, true, None)?;
+        drop(out_stage);
         crate::execution::purge_pool(&self.device);
 
-        // Exercise every sparse pool bucket before any timed view. The zero
-        // input is shape-only during compile-only replay; light networks stay dense.
+        // 4. Exercise every sparse pool bucket sequentially, synchronizing and purging
+        // after each bucket so all 24 sparse bucket graphs are never queued in flight at once.
         for stage in 0..4 {
-            let channels = [64,128,256,512][stage];
-            let spatial = [65536,16384,4096,1024][stage];
-            for &bucket in &[256,512,1024,2048,4096,8192,16384,32768] {
-                if bucket >= spatial || bucket > self.options.pixel_batch { continue; }
-                let prefix = format!("Net_stage.pool_block{}",stage+1);
-                let dummy = Tensor::zeros([bucket,lights,channels],self.tensor_options());
-                let processed = self.set_layer(dummy.clone(),&prefix,true);
-                let indices = Tensor::<1,burn::tensor::Int>::from_data(TensorData::new(vec![0_i32;bucket],[bucket]),&self.device);
-                let inverse = Tensor::<1,burn::tensor::Int>::from_data(TensorData::new(vec![-1_i32;spatial],[spatial]),&self.device);
-                let gather_warm = crate::remap::forward(dummy,indices);
-                let scatter_warm = crate::remap::forward(processed,inverse);
-                self.device.flush().map_err(|e|anyhow::anyhow!("Sparse warmup submission failed: {e:?}"))?;
-                drop((gather_warm,scatter_warm));
+            let channels = [64, 128, 256, 512][stage];
+            let spatial = [65536, 16384, 4096, 1024][stage];
+            for &bucket in &[256, 512, 1024, 2048, 4096, 8192, 16384, 32768] {
+                if bucket >= spatial || bucket > self.options.pixel_batch {
+                    continue;
+                }
+                let prefix = format!("Net_stage.pool_block{}", stage + 1);
+                let dummy = Tensor::zeros([bucket, lights, channels], self.tensor_options());
+                let processed = self.set_layer(dummy.clone(), &prefix, true);
+                let indices = Tensor::<1, burn::tensor::Int>::from_data(
+                    TensorData::new(vec![0_i32; bucket], [bucket]),
+                    &self.device,
+                );
+                let inverse = Tensor::<1, burn::tensor::Int>::from_data(
+                    TensorData::new(vec![-1_i32; spatial], [spatial]),
+                    &self.device,
+                );
+                let gather_warm = crate::remap::forward(dummy, indices);
+                let scatter_warm = crate::remap::forward(processed, inverse);
+                drop((gather_warm, scatter_warm));
+                crate::execution::purge_pool(&self.device);
             }
         }
 
-        // 5. Ensure all pipeline shader compilations and autotunings complete and release warmup slabs
-        crate::execution::purge_pool(&self.device);
         Ok(())
     }
 

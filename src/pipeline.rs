@@ -543,17 +543,13 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
             let mut patch_host_mask = vec![false; 256 * 256];
             let is_final_scale = i + 1 == stages;
             let lights = input.images.len();
-            // Move `images` and `prior` directly into `full_device_images` when RGB is on-device
-            // so we do not hold duplicate 36-54 MiB `images` and 6 MiB `prior` tensors across all 49 patches.
-            let (active, prior_host, full_device_images) = match active {
-                ImageLevel::Device(images) => {
-                    let full = Tensor::cat(
-                        vec![images, prior.repeat_dim(0, lights)],
-                        1,
-                    );
-                    (None, None, Some(full))
-                }
-                ImageLevel::Host(host_imgs) => (Some(host_imgs), Some(prior), None),
+            // Keep `device_images` ([lights, 3, size, size]) and `prior` ([1, 3, size, size])
+            // separate instead of materializing a full-frame `prior.repeat_dim(0, lights)` +
+            // `Tensor::cat` ([lights, 6, size, size]), avoiding 156+ MiB of large un-bucketed
+            // full-frame allocations at 1024x1024. Each 256x256 patch slices both on-device.
+            let (active, device_images) = match active {
+                ImageLevel::Device(images) => (None, Some(images)),
+                ImageLevel::Host(host_imgs) => (Some(host_imgs), None),
             };
             for y in (0..=size - 256).step_by(128) {
                 for x in (0..=size - 256).step_by(128) {
@@ -593,17 +589,17 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     let mut patch_trace = crate::trace::Patch::start(size,y,x,fg_count);
                     let _patch_profile = crate::profile::phase(&model.device, || format!("patch/size={size} y={y} x={x} foreground={fg_count}"));
                     let prepare_patch_profile = crate::profile::span(&model.device, || format!("patch/prepare size={size}"));
-                    let (images, n_opt) = match &full_device_images {
-                        Some(full) => {
-                            let patch = full.clone().slice([0..lights, 0..6, y..y + 256, x..x + 256]);
-                            (patch, None)
+                    let (images, n_opt) = match &device_images {
+                        Some(dev_imgs) => {
+                            let imgs = dev_imgs.clone().slice([0..lights, 0..3, y..y + 256, x..x + 256]);
+                            let n = prior.clone().slice([0..1, 0..3, y..y + 256, x..x + 256]);
+                            (imgs, Some(n))
                         }
                         None => {
-                            let images = active.as_ref().expect("Host images exist when full_device_images is None");
-                            let prior_ref = prior_host.as_ref().expect("Host prior exists when full_device_images is None");
+                            let images = active.as_ref().expect("Host images exist when device_images is None");
                             let patches: Vec<_> = images.par_iter().map(|r| r.crop(y, x, 256, 256)).collect();
                             let imgs = upload_images(model, &patches);
-                            let n = prior_ref.clone().slice([0..1, 0..3, y..y + 256, x..x + 256]);
+                            let n = prior.clone().slice([0..1, 0..3, y..y + 256, x..x + 256]);
                             (imgs, Some(n))
                         }
                     };
@@ -646,8 +642,8 @@ pub fn process_with_options(model: &Model, input: &Input, options: ProcessOption
                     eprintln!("  Patch {count}/{total} {}", if crate::execution::depth() != 0 || crate::profile::enabled() { "completed" } else { "queued" });
                 }
             }
-            drop(full_device_images);
-            drop(prior_host);
+            drop(device_images);
+            drop(prior);
             drop(active);
             crate::execution::checkpoint_patch(&model.device, submitted);
             crate::execution::trim_memory(&model.device);
