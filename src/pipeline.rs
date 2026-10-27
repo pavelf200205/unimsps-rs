@@ -101,6 +101,43 @@ impl Raster {
         }
         out
     }
+    /// Area-weighted pixel-footprint averaging for antialiased downsampling.
+    /// Uses positive weights only, preserving intensity bounds without ringing.
+    fn resize_area(&self, h: usize, w: usize) -> Self {
+        fn weights(src: usize, dst: usize) -> Vec<Vec<(usize, f32)>> {
+            let scale = src as f64 / dst as f64;
+            (0..dst).map(|i| {
+                let left = i as f64 * scale;
+                let right = (i + 1) as f64 * scale;
+                (left.floor() as usize..(right.ceil() as usize).min(src))
+                    .map(|j| (j, ((right.min((j + 1) as f64) - left.max(j as f64)) / scale) as f32))
+                    .collect()
+            }).collect()
+        }
+        let wx = weights(self.w, w);
+        let wy = weights(self.h, h);
+        let mut horizontal = Self::zeros(self.c, self.h, w);
+        for c in 0..self.c {
+            for y in 0..self.h {
+                for (x, taps) in wx.iter().enumerate() {
+                    horizontal.data[(c * self.h + y) * w + x] = taps.iter()
+                        .map(|&(sx, weight)| self.data[(c * self.h + y) * self.w + sx] * weight)
+                        .sum();
+                }
+            }
+        }
+        let mut out = Self::zeros(self.c, h, w);
+        for c in 0..self.c {
+            for (y, taps) in wy.iter().enumerate() {
+                for x in 0..w {
+                    out.data[(c * h + y) * w + x] = taps.iter()
+                        .map(|&(sy, weight)| horizontal.data[(c * self.h + sy) * w + x] * weight)
+                        .sum();
+                }
+            }
+        }
+        out
+    }
     pub fn normalize(&mut self) {
         let n = self.h * self.w;
         for i in 0..n {
@@ -121,6 +158,10 @@ pub struct Input {
     pub size: usize,
     pub original: [usize; 2],
     pub crop: [usize; 4],
+    /// Height/width of the crop actually fed to inference, before square padding.
+    pub inference_crop: [usize; 2],
+    /// Original-resolution crop mask, used to restore the silhouette after resizing.
+    pub crop_mask: Vec<bool>,
     pub padding: [usize; 2],
     pub files: Vec<PathBuf>,
 }
@@ -134,7 +175,15 @@ impl Input {
     /// Sorting before sampling makes selection independent of directory enumeration
     /// and of which other views have already been processed.
     pub fn load_with_seed(path: &Path, limit: Option<usize>, seed: u64) -> Result<Self> {
+        Self::load_with_options(path, limit, seed, None)
+    }
+
+    /// Optionally shrinks the masked crop to a power-of-two inference limit.
+    /// The original crop geometry is retained for full-resolution normal output.
+    pub fn load_with_options(path: &Path, limit: Option<usize>, seed: u64, max_resolution: Option<usize>) -> Result<Self> {
         ensure!(limit != Some(0), "Image count must be positive");
+        ensure!(max_resolution.is_none_or(|n| n >= 32 && n.is_power_of_two()),
+            "Maximum inference resolution must be a power of two of at least 32");
         let mut files: Vec<_> = std::fs::read_dir(path)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
@@ -196,13 +245,31 @@ impl Input {
         );
         let ch = ymax - ymin;
         let cw = xmax - xmin;
-        let size = ch.max(cw).max(32).next_power_of_two();
-        let py = (size - ch) / 2;
-        let px = (size - cw) / 2;
-        let mut padded_mask = vec![false; size * size];
+        let longest = ch.max(cw);
+        let (ih, iw) = if let Some(cap) = max_resolution.filter(|&n| longest > n) {
+            let scaled = |d: usize| (((d as u128 * cap as u128 + longest as u128 / 2)
+                / longest as u128) as usize).clamp(1, cap);
+            (scaled(ch), scaled(cw))
+        } else { (ch, cw) };
+        let resized = [ih, iw] != [ch, cw];
+        let size = ih.max(iw).max(32).next_power_of_two();
+        let py = (size - ih) / 2;
+        let px = (size - iw) / 2;
+        let mut crop_mask = vec![false; ch * cw];
         for y in 0..ch {
-            for x in 0..cw {
-                padded_mask[(y + py) * size + x + px] = mask[(y + ymin) * w + x + xmin];
+            crop_mask[y * cw..(y + 1) * cw]
+                .copy_from_slice(&mask[(y + ymin) * w + xmin..(y + ymin) * w + xmin + cw]);
+        }
+        let inference_mask = if resized {
+            // Any covered source foreground keeps the destination pixel active,
+            // so thin foreground structures are not erased by nearest sampling.
+            Raster { c: 1, h: ch, w: cw, data: crop_mask.iter().map(|&m| if m { 1. } else { 0. }).collect() }
+                .resize_area(ih, iw).data.into_iter().map(|v| v > 0.).collect::<Vec<_>>()
+        } else { crop_mask.clone() };
+        let mut padded_mask = vec![false; size * size];
+        for y in 0..ih {
+            for x in 0..iw {
+                padded_mask[(y + py) * size + x + px] = inference_mask[y * iw + x];
             }
         }
         use rayon::prelude::*;
@@ -217,17 +284,18 @@ impl Input {
                     "Image dimensions differ: {}",
                     file.display()
                 );
-                let mut r = Raster::zeros(3, size, size);
+                // Avoid allocating an uncapped padded square when downsampling.
+                let mut r = if resized { Raster::zeros(3, ch, cw) } else { Raster::zeros(3, size, size) };
                 let mut sum = 0f64;
                 let mut count = 0usize;
                 for y in 0..ch {
                     for x in 0..cw {
                         let p = img.get_pixel((x + xmin) as u32, (y + ymin) as u32);
-                        let idx = (y + py) * size + x + px;
-                        let is_fg = padded_mask[idx];
+                        let idx = if resized { y * cw + x } else { (y + py) * size + x + px };
+                        let is_fg = crop_mask[y * cw + x];
                         for c in 0..3 {
                             let v = p[2 - c];
-                            r.data[c * size * size + idx] = v;
+                            r.data[c * r.h * r.w + idx] = v;
                             if is_fg {
                                 sum += v as f64;
                                 count += 1;
@@ -244,6 +312,16 @@ impl Input {
                 for v in &mut r.data {
                     *v *= inv_mean;
                 }
+                if resized {
+                    let small = r.resize_area(ih, iw);
+                    r = Raster::zeros(3, size, size);
+                    for c in 0..3 {
+                        for y in 0..ih {
+                            r.data[(c * size + y + py) * size + px..(c * size + y + py) * size + px + iw]
+                                .copy_from_slice(&small.data[(c * ih + y) * iw..(c * ih + y + 1) * iw]);
+                        }
+                    }
+                }
                 Ok(r)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -253,6 +331,8 @@ impl Input {
             size,
             original: [h, w],
             crop: [ymin, xmin, ch, cw],
+            inference_crop: [ih, iw],
+            crop_mask,
             padding: [py, px],
             files,
         })
@@ -262,6 +342,23 @@ impl Input {
         let [y, x, ch, cw] = self.crop;
         let [py, px] = self.padding;
         let mut out = Raster::zeros(3, h, w);
+        if self.inference_crop != [ch, cw] {
+            let [ih, iw] = self.inference_crop;
+            // Half-pixel bilinear coordinates invert the area-resize footprint
+            // mapping. Interpolate signed vector components, never encoded RGB.
+            let mut restored = normal.crop(py, px, ih, iw).resize(ch, cw, false);
+            restored.normalize();
+            for j in 0..ch {
+                for i in 0..cw {
+                    if self.crop_mask[j * cw + i] {
+                        for c in 0..3 {
+                            out.data[(c * h + y + j) * w + x + i] = restored.data[(c * ch + j) * cw + i];
+                        }
+                    }
+                }
+            }
+            return out;
+        }
         for c in 0..3 {
             for j in 0..ch {
                 for i in 0..cw {

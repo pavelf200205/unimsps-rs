@@ -115,6 +115,9 @@ enum Command {
         /// Seed for reproducible image sampling, restarted independently for each view.
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Cap the padded inference square (power of two >= 32); outputs retain original resolution.
+        #[arg(long, visible_alias = "max-inference-resolution")]
+        max_resolution: Option<usize>,
         /// Treat each immediate subdirectory as a separate object, loading the model once.
         #[arg(long)]
         batch: bool,
@@ -132,6 +135,10 @@ enum Command {
 fn main() -> Result<()> {
     let program_start = std::time::Instant::now();
     let cli = Cli::parse();
+    if let Command::Infer { max_resolution: Some(n), .. } = &cli.command {
+        ensure!(*n >= 32 && n.is_power_of_two(),
+            "--max-resolution must be a power of two of at least 32 (for example 512, 1024, 2048)");
+    }
     let cache_dir = cli.kernel_cache_dir.clone().unwrap_or_else(default_cache_dir);
     // Parse --help/--version normally, then supervise inference before any GPU
     // initialization. Only NVIDIA observes these driver environment variables.
@@ -139,11 +146,15 @@ fn main() -> Result<()> {
         && matches!(cli.api.as_str(), "auto" | "vulkan")
         && matches!(&cli.command, Command::Infer { .. });
     if isolated && !cli.internal_cache_worker {
-        let images = match &cli.command { Command::Infer { images, .. } => *images, _ => unreachable!() };
+        let (images, max_resolution) = match &cli.command {
+            Command::Infer { images, max_resolution, .. } => (*images, *max_resolution),
+            _ => unreachable!(),
+        };
         let profile = if cli.driver_cache_per_workload {
             eprintln!("NVIDIA driver snapshot policy: separate per workload");
             serde_json::json!({
             "api":cli.api,"integrated":cli.integrated,"images":images,
+            "max_resolution":max_resolution,
             "precision":cli.precision,"encoder_batch":cli.encoder_batch,
             "pixel_batch":cli.pixel_batch,"query_batch":cli.query_batch,
             "scores":cli.score_budget_mib,"fused_attention":cli.fused_attention,
@@ -246,6 +257,7 @@ fn main() -> Result<()> {
             out,
             images,
             seed,
+            max_resolution,
             batch,
         } => {
             ensure!(images == -1 || images > 0, "--images must be -1 (all) or a positive count");
@@ -379,7 +391,12 @@ fn main() -> Result<()> {
                 };
                 unimsps::trace::begin_view();
                 let input_profile = unimsps::profile::phase(&net.device, || "input/decode-crop-normalize".into());
-                let input = Input::load_with_seed(&object, image_limit, seed)?;
+                let input = Input::load_with_options(&object, image_limit, seed, max_resolution)?;
+                if input.inference_crop != [input.crop[2], input.crop[3]] {
+                    eprintln!("Resolution cap: masked crop {} x {} -> {} x {}; normals restored to {} x {}",
+                        input.crop[3], input.crop[2], input.inference_crop[1], input.inference_crop[0],
+                        input.original[1], input.original[0]);
+                }
                 drop(input_profile);
                 eprintln!(
                     "{}: {} images; padded size {}",
@@ -419,6 +436,10 @@ fn main() -> Result<()> {
                             "normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip",
                             "input_channels":"BGR","files":input.files,"model":model,"seconds":view_seconds,
                             "sampling_seed":seed,"image_sampling":"chacha8_shuffle_without_replacement_v1",
+                            "max_inference_resolution":max_resolution,
+                            "inference_crop_hw":input.inference_crop,"original_crop_yxhw":input.crop,
+                            "resolution_resampled":input.inference_crop != [input.crop[2], input.crop[3]],
+                            "resolution_resampling_policy":"area_inputs_bilinear_normals_renormalized_v1",
                             "nvidia_driver_cache_session":std::env::var_os(driver_cache::SESSION_ENV).map(PathBuf::from),
                             "nvidia_driver_cache_policy":if isolated { Some(if cli.driver_cache_per_workload { "per_workload" } else { "shared" }) } else { None },
                             "inference_seconds":inference_seconds,"output_seconds":view_seconds-inference_seconds,

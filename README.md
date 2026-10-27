@@ -56,6 +56,32 @@ Use the executable from whichever target directory you selected:
   lists use the same light indices. This does not reproduce NumPy's exact random
   sequence. When all images are used, their sorted order is unchanged.
   Each view's metadata records the seed, sampling algorithm and selected files.
+- `--max-resolution N` (alias `--max-inference-resolution`) limits the padded
+  inference square to `N x N`. Valid values are powers of two of at least 32,
+  for example 512, 1024 or 2048. Omit it for the original unlimited behavior.
+  The cap is applied **after mask cropping**, before square padding: if the
+  crop's longest side exceeds N, the crop is reduced proportionally (rounded
+  to integer dimensions). Smaller crops are not enlarged. A 1024 cap prevents
+  inference from entering the 2048 scale, even if the crop only slightly exceeds
+  1024 pixels. Network preparation remains a separate fixed-shape warmup.
+  For example, append `--nb_img 6 --seed 42 --max-resolution 1024` to an infer command.
+
+  Input reduction uses area-weighted averaging in float32, after the existing
+  original-mask intensity normalization. This antialiases the photographs without
+  introducing ringing/overshoot. The low-resolution mask retains any foreground
+  coverage to avoid dropping thin features. Resulting signed normal components
+  are bilinearly upsampled with matching half-pixel coordinates, renormalized to
+  unit length, and masked with the original crop mask before insertion into the
+  original full-resolution canvas. All output formats retain the original image
+  dimensions. Existing upstream exclusive-maximum crop bounds remain unchanged.
+  Upsampling cannot recover detail discarded by a lower inference resolution.
+  Lanczos/cubic overshoot is avoided for both intensities and vector components;
+  trilinear filtering is not needed for these 2D resampling steps.
+
+  Console output reports any crop reduction. Metadata records the requested cap,
+  original crop, inference crop, actual padded size and resampling policy. The
+  default shared driver snapshot remains shared across resolution caps; with
+  `--driver-cache-per-workload`, the cap is part of the workload profile.
 - Add `--batch` to process each immediate subdirectory as a separate object.
   Weights load once; each object gets its own output subfolder.
 - PNG, JPEG, TIFF, grayscale, and 16-bit images are supported. All images must
