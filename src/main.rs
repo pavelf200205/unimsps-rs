@@ -2,6 +2,7 @@ use anyhow::{Result, ensure};
 use burn::tensor::{Device, DeviceKind, FloatDType};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+mod driver_cache;
 use unimsps::{
     cache::{
         build_id, checkpoint_and_report, configure_runtime, default_cache_dir, init_environment,
@@ -86,6 +87,11 @@ struct Cli {
     /// Disable persistent GPU kernel caching across runs.
     #[arg(long, global = true)]
     no_kernel_cache: bool,
+    /// Start with an empty NVIDIA driver cache and replace its seed only after successful process exit.
+    #[arg(long, global = true)]
+    refresh_driver_cache: bool,
+    #[arg(long, hide = true, global = true)]
+    internal_cache_worker: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -100,9 +106,12 @@ enum Command {
         data: PathBuf,
         #[arg(long)]
         out: PathBuf,
-        /// Number of input photographs; -1 uses all. A subset uses lexical filename order.
+        /// Number of input photographs; -1 uses all. Subsets are sampled randomly without replacement.
         #[arg(long, visible_aliases = ["nb-img", "nb_img", "num-images", "num_images", "num-imgs", "num_imgs"], default_value_t = -1, allow_hyphen_values = true)]
         images: isize,
+        /// Seed for reproducible image sampling, restarted independently for each view.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
         /// Treat each immediate subdirectory as a separate object, loading the model once.
         #[arg(long)]
         batch: bool,
@@ -120,6 +129,30 @@ enum Command {
 fn main() -> Result<()> {
     let program_start = std::time::Instant::now();
     let cli = Cli::parse();
+    let cache_dir = cli.kernel_cache_dir.clone().unwrap_or_else(default_cache_dir);
+    // Parse --help/--version normally, then supervise inference before any GPU
+    // initialization. Only NVIDIA observes these driver environment variables.
+    let isolated = cfg!(windows) && !cli.cpu && !cli.cuda
+        && matches!(cli.api.as_str(), "auto" | "vulkan")
+        && matches!(&cli.command, Command::Infer { .. });
+    if isolated && !cli.internal_cache_worker {
+        let images = match &cli.command { Command::Infer { images, .. } => *images, _ => unreachable!() };
+        let profile = serde_json::json!({
+            "api":cli.api,"integrated":cli.integrated,"images":images,
+            "precision":cli.precision,"encoder_batch":cli.encoder_batch,
+            "pixel_batch":cli.pixel_batch,"query_batch":cli.query_batch,
+            "scores":cli.score_budget_mib,"fused_attention":cli.fused_attention,
+            "unfused_attention":cli.unfused_attention,"burn_softmax":cli.burn_softmax,
+            "reference_encoder":cli.reference_encoder,"burn_convolutions":cli.burn_convolutions,
+            "no_warmup":cli.no_warmup
+        }).to_string();
+        let status = driver_cache::supervise(&cache_dir, profile, !cli.no_kernel_cache, cli.refresh_driver_cache)?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    if cli.internal_cache_worker {
+        ensure!(isolated && std::env::var_os(driver_cache::SESSION_ENV)
+            .is_some_and(|p| PathBuf::from(p).is_dir()), "Cache worker requires a supervisor-created session");
+    }
     eprintln!(
         "unimsps {} (persistent kernel cache + bounded warmup; Burn 0.22.0 / CubeCL 0.11.0)",
         env!("UNIMSPS_GIT_REVISION")
@@ -130,7 +163,6 @@ fn main() -> Result<()> {
     unimsps::execution::configure(cli.queue_depth);
     unimsps::execution::configure_pool_cache(cli.pool_cache_mib);
 
-    let cache_dir = cli.kernel_cache_dir.clone().unwrap_or_else(default_cache_dir);
     let cache_enabled = !cli.no_kernel_cache && !cli.cpu;
     configure_runtime(&cache_dir, cache_enabled);
     let mut kernel_cache = if cache_enabled {
@@ -202,6 +234,7 @@ fn main() -> Result<()> {
             data,
             out,
             images,
+            seed,
             batch,
         } => {
             ensure!(images == -1 || images > 0, "--images must be -1 (all) or a positive count");
@@ -335,7 +368,7 @@ fn main() -> Result<()> {
                 };
                 unimsps::trace::begin_view();
                 let input_profile = unimsps::profile::phase(&net.device, || "input/decode-crop-normalize".into());
-                let input = Input::load(&object, image_limit)?;
+                let input = Input::load_with_seed(&object, image_limit, seed)?;
                 drop(input_profile);
                 eprintln!(
                     "{}: {} images; padded size {}",
@@ -374,6 +407,8 @@ fn main() -> Result<()> {
                             "width":normal.w,"height":normal.h,"formats":save_formats.names(),
                             "normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip",
                             "input_channels":"BGR","files":input.files,"model":model,"seconds":view_seconds,
+                            "sampling_seed":seed,"image_sampling":"chacha8_shuffle_without_replacement_v1",
+                            "nvidia_driver_cache_session":std::env::var_os(driver_cache::SESSION_ENV).map(PathBuf::from),
                             "inference_seconds":inference_seconds,"output_seconds":view_seconds-inference_seconds,
                             "precision":format!("{dtype:?}"),"api":effective_api,"encoder_batch":effective_encoder_batch,
                             "pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,

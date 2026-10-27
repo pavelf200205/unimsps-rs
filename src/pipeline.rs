@@ -13,6 +13,8 @@ use burn_fusion::{
 };
 use cubecl::prelude::*;
 use image::{ImageBuffer, Rgb};
+use rand::{SeedableRng, seq::SliceRandom};
+use rand_chacha::ChaCha8Rng;
 use std::path::{Path, PathBuf};
 
 type Gpu = Fusion<CubeBackend>;
@@ -125,6 +127,13 @@ pub struct Input {
 impl Input {
     /// Matches the upstream exclusive maximum mask bounding box, including its omitted last row/column.
     pub fn load(path: &Path, limit: Option<usize>) -> Result<Self> {
+        Self::load_with_seed(path, limit, 42)
+    }
+
+    /// Loads a view, sampling without replacement using a fresh seeded RNG.
+    /// Sorting before sampling makes selection independent of directory enumeration
+    /// and of which other views have already been processed.
+    pub fn load_with_seed(path: &Path, limit: Option<usize>, seed: u64) -> Result<Self> {
         ensure!(limit != Some(0), "Image count must be positive");
         let mut files: Vec<_> = std::fs::read_dir(path)?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -145,10 +154,13 @@ impl Input {
                     && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "tif" | "tiff")
             })
             .collect();
-        // Stable order and deterministic subset; the Python command randomly chooses subsets.
+        // Match upstream's sampling without replacement, with reproducible randomness.
         files.sort();
         if let Some(n) = limit {
-            files.truncate(n);
+            if n < files.len() {
+                files.shuffle(&mut ChaCha8Rng::seed_from_u64(seed));
+                files.truncate(n);
+            }
         }
         ensure!(!files.is_empty(), "No input images in {}", path.display());
         let first = image::open(&files[0])?;

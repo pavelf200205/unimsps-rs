@@ -49,7 +49,8 @@ pub fn configure_runtime(cache_dir: &Path, enabled: bool) {
         set_env_if_absent("__GL_SHADER_DISK_CACHE", "1");
         set_env_if_absent("__GL_SHADER_DISK_CACHE_PATH", &driver_gl_dir);
         set_env_if_absent("__GL_SHADER_DISK_CACHE_SIZE", "2147483648");
-        set_env_if_absent("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1");
+        // Managed workers use a disposable driver cache. Do not force NVIDIA's
+        // undocumented cleanup override; the supervisor controls its lifetime.
 
         set_env_if_absent("CUDA_CACHE_DISABLE", "0");
         set_env_if_absent("CUDA_CACHE_PATH", &driver_cuda_dir);

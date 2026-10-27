@@ -162,10 +162,13 @@ type OriginVisitor<'a> = dyn FnMut(&[u8], &[u8], Origin) + 'a;
 /// How a database opened at a path ([`Database::open_at`]) may be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
+    /// Request read-only access to an existing database.
     ReadOnly,
+    /// Request read/write access, allowing database creation when needed.
     ReadWrite,
 }
 
+/// A synchronized connection handle to a persistent cache database.
 pub struct Database {
     /// Shared across handles to the active environment's database so
     /// `wal_checkpoint(TRUNCATE)` never contends with open store connections.
@@ -198,6 +201,7 @@ impl Database {
         })
     }
 
+    /// Opens the active environment's cache, logging failures and returning `None`.
     pub fn open_active() -> Option<Self> {
         match Self::open() {
             Ok(database) => Some(database),
@@ -209,6 +213,9 @@ impl Database {
     }
 
     #[cfg(native_cache)]
+    /// Opens a cache at `path` with the requested access, reusing the active
+    /// environment's shared connection when the paths refer to the same file.
+    /// Returns an error if the path cannot be represented or the database cannot open.
     pub fn open_at(path: &std::path::Path, access: Access) -> Result<Self, String> {
         let active = location()
             .ok()

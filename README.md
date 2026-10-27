@@ -48,8 +48,14 @@ Use the executable from whichever target directory you selected:
 ```
 
 - `--images N`, `--nb-img N`, and `--nb_img N` select the number of photographs.
-  Omit the option or use `-1` for all images. Subsets use lexical filename order;
-  the upstream Python tool chooses random subsets.
+  Omit the option or use `-1` for all images. Subsets are sampled randomly without
+  replacement, like upstream Python. `--seed 42` is the default; supply another
+  unsigned integer to select a different reproducible subset. Filenames are sorted
+  before a seeded ChaCha8 shuffle. The seed restarts for each view, so processing
+  a view alone or in a batch selects the same files; views with identical filename
+  lists use the same light indices. This does not reproduce NumPy's exact random
+  sequence. When all images are used, their sorted order is unchanged.
+  Each view's metadata records the seed, sampling algorithm and selected files.
 - Add `--batch` to process each immediate subdirectory as a separate object.
   Weights load once; each object gets its own output subfolder.
 - PNG, JPEG, TIFF, grayscale, and 16-bit images are supported. All images must
@@ -226,6 +232,63 @@ Use normal runs to compare throughput and --verbose separately to inspect
 conv-pack and conv-matmul costs. This source change has not been built or timed.
 
 ## Persistent preparation update
+
+### NVIDIA driver-cache snapshots (Windows Vulkan)
+
+Normal `infer` commands now run through a small supervisor. No extra flag is
+needed. Before inference, it creates a fresh working directory for NVIDIA's
+driver cache; after the inference process **fully exits successfully**, it saves
+the first populated cache as an immutable seed. Every later launch copies that
+same seed to a new working directory. NVIDIA may modify the working copy, but
+those modifications never replace the seed. Successful reused copies are removed
+after exit; failed/interrupted sessions are preserved for diagnosis and never
+published. A killed supervisor can leave a session directory behind; these are
+not reused or automatically swept on the next launch.
+
+The seed lives beneath
+`<kernel-cache-dir>/nvidia-driver-snapshots-v1/<profile>/seed`, with disposable
+copies under the neighboring `sessions` directory. Console output identifies
+both paths; per-view metadata records the worker's driver-cache path. The seed's
+file hashes are checked before copying. Existing `nvidia_gl_cache` folders and
+manual backups are **left untouched and never imported automatically**, since
+they may contain the problematic accumulated state. Expect some driver compilation
+on the first launch of this build even with an existing CubeCL database.
+
+Profiles include the executable SHA-256, relevant kernel options/image count,
+and a conservative Windows NVIDIA installation-file stamp when available. Thus
+six and nine images get separate seeds. Seed/data/output paths are excluded:
+changing the random sampling seed or dataset does not itself create a new profile.
+With `--images -1`, different actual image counts share the all-images profile;
+use explicit counts or separate cache roots if separate coverage is desired.
+Use separate cache roots when selecting different physical GPUs. NVIDIA's own
+internal directories also distinguish hardware/driver compatibility.
+
+Use `--refresh-driver-cache` to deliberately start empty and publish a new seed
+after success (for example after a driver change or to cover a different dataset).
+The old seed is archived, not deleted. If installation fingerprinting is unavailable,
+the program warns to use this option after driver changes. A reused seed never
+learns additional shaders automatically; missing shaders can compile into its
+disposable working copy again on subsequent runs.
+
+The supervisor overrides inherited `__GL_SHADER_DISK_CACHE*` path/enable/size
+settings for the worker and removes the forced skip-cleanup override. It does
+not initialize a GPU itself. Its environment changes apply only to its child.
+Only NVIDIA consumes these variables; AMD/Intel/Mesa persistence is unchanged.
+The wrapper is limited to Windows `infer` with `--api auto`/`vulkan`; CPU, CUDA,
+DX12, Metal and non-Windows paths retain their existing behavior. No change to
+the inference backend or NVIDIA-only compute dependency is introduced.
+
+One reconstruction at a time may use a managed cache root, enforced by a Windows
+exclusive file handle that is released when the supervisor exits. Concurrent
+reconstructions must specify different `--kernel-cache-dir` values because the
+CubeCL runtime database is shared too. `--no-kernel-cache` uses a fresh disposable
+NVIDIA cache each launch and neither reads nor publishes a seed. This does not
+promise to disable all other caches maintained internally by the driver.
+
+This workaround preserves CubeCL's separate SPIR-V/tuning database. It reproduces
+the successful manual cache-restore experiment; it does not claim to repair the
+underlying driver issue or eliminate all runtime shader compilation. The worker's
+reported run time excludes the parent's snapshot copying and cleanup.
 
 See [CACHE_AND_SCHEDULING.md](CACHE_AND_SCHEDULING.md) for the current cache,
 compile-only startup replay, sparse remapping and queue/memory policies. This

@@ -1,5 +1,20 @@
 # Persistent preparation and bounded execution
 
+## Current driver-cache policy (2026-10-27)
+
+Windows Vulkan inference is now supervised by `src/driver_cache.rs`: each worker
+gets a disposable NVIDIA GLCache copied from an immutable first-successful-run
+seed. The supervisor waits for worker exit before publishing a new seed. Later
+sessions never update that seed. See the README's **NVIDIA driver-cache snapshots**
+section for paths, refresh behavior, concurrency and limitations.
+
+The sections below retain historical implementation notes. In current code the
+CubeCL database environment is schema-named `unimsps-v4`, not revision-named;
+only the new driver snapshot profile includes the executable content hash.
+Current warmup executes model passes with pool cleanup; it is not a DryRun-only
+replay. Database write freezing does not prohibit tuning on cache misses.
+These statements supersede older descriptions below.
+
 CubeCL 0.11 supports persistent compiled SPIR-V artifacts and autotune decisions.
 The project now enables cubecl/vulkan and cubecl/persistence and configures the
 runtime store before initializing the device. No CUDA dependency is required.
