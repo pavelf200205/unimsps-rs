@@ -254,18 +254,29 @@ manual backups are **left untouched and never imported automatically**, since
 they may contain the problematic accumulated state. Expect some driver compilation
 on the first launch of this build even with an existing CubeCL database.
 
-Profiles include the executable SHA-256, relevant kernel options/image count,
-and a conservative Windows NVIDIA installation-file stamp when available. Thus
-six and nine images get separate seeds. Seed/data/output paths are excluded:
-changing the random sampling seed or dataset does not itself create a new profile.
-With `--images -1`, different actual image counts share the all-images profile;
-use explicit counts or separate cache roots if separate coverage is desired.
+By default, all workloads in the same cache root share one first-successful-run
+snapshot for the same executable SHA-256 and Windows NVIDIA installation-file
+stamp (when available). If six images create the snapshot, a subsequent nine-image
+run starts from a copy of that six-image snapshot. Extra shaders compile into the
+disposable copy only; they are never added to the master snapshot. A later six-
+or nine-image run starts from the same original snapshot again. Missing shaders
+may consequently need recompilation on each launch of a different workload.
+
+Add `--driver-cache-per-workload` to restore the previous policy: image count and
+relevant kernel options select separate snapshots, so six images create snapshot
+A and nine images create snapshot B. Shared and per-workload snapshots occupy
+separate namespaces; switching policies does not overwrite either snapshot.
+With this flag and `--images -1`, different actual image counts share the
+all-images profile; use explicit counts if separate coverage is desired.
+Neither policy includes dataset/output paths or the random sampling seed in its
+snapshot key. The console and per-view metadata record the selected policy.
 Use separate cache roots when selecting different physical GPUs. NVIDIA's own
 internal directories also distinguish hardware/driver compatibility.
 
 Use `--refresh-driver-cache` to deliberately start empty and publish a new seed
 after success (for example after a driver change or to cover a different dataset).
-The old seed is archived, not deleted. If installation fingerprinting is unavailable,
+Only the selected policy/profile's seed is refreshed; the old seed is archived,
+not deleted. If installation fingerprinting is unavailable,
 the program warns to use this option after driver changes. A reused seed never
 learns additional shaders automatically; missing shaders can compile into its
 disposable working copy again on subsequent runs.

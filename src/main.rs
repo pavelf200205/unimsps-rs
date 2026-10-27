@@ -90,6 +90,9 @@ struct Cli {
     /// Start with an empty NVIDIA driver cache and replace its seed only after successful process exit.
     #[arg(long, global = true)]
     refresh_driver_cache: bool,
+    /// Keep separate NVIDIA driver snapshots per image count/kernel settings instead of one shared snapshot.
+    #[arg(long, global = true)]
+    driver_cache_per_workload: bool,
     #[arg(long, hide = true, global = true)]
     internal_cache_worker: bool,
     #[command(subcommand)]
@@ -137,7 +140,9 @@ fn main() -> Result<()> {
         && matches!(&cli.command, Command::Infer { .. });
     if isolated && !cli.internal_cache_worker {
         let images = match &cli.command { Command::Infer { images, .. } => *images, _ => unreachable!() };
-        let profile = serde_json::json!({
+        let profile = if cli.driver_cache_per_workload {
+            eprintln!("NVIDIA driver snapshot policy: separate per workload");
+            serde_json::json!({
             "api":cli.api,"integrated":cli.integrated,"images":images,
             "precision":cli.precision,"encoder_batch":cli.encoder_batch,
             "pixel_batch":cli.pixel_batch,"query_batch":cli.query_batch,
@@ -145,7 +150,13 @@ fn main() -> Result<()> {
             "unfused_attention":cli.unfused_attention,"burn_softmax":cli.burn_softmax,
             "reference_encoder":cli.reference_encoder,"burn_convolutions":cli.burn_convolutions,
             "no_warmup":cli.no_warmup
-        }).to_string();
+            }).to_string()
+        } else {
+            // A fixed namespace makes 6/9/all-image and other workload variants
+            // copy the same first-successful-run seed. Never promote reused copies.
+            eprintln!("NVIDIA driver snapshot policy: shared across workloads");
+            "shared-workloads-v1".to_owned()
+        };
         let status = driver_cache::supervise(&cache_dir, profile, !cli.no_kernel_cache, cli.refresh_driver_cache)?;
         std::process::exit(status.code().unwrap_or(1));
     }
@@ -409,6 +420,7 @@ fn main() -> Result<()> {
                             "input_channels":"BGR","files":input.files,"model":model,"seconds":view_seconds,
                             "sampling_seed":seed,"image_sampling":"chacha8_shuffle_without_replacement_v1",
                             "nvidia_driver_cache_session":std::env::var_os(driver_cache::SESSION_ENV).map(PathBuf::from),
+                            "nvidia_driver_cache_policy":if isolated { Some(if cli.driver_cache_per_workload { "per_workload" } else { "shared" }) } else { None },
                             "inference_seconds":inference_seconds,"output_seconds":view_seconds-inference_seconds,
                             "precision":format!("{dtype:?}"),"api":effective_api,"encoder_batch":effective_encoder_batch,
                             "pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,

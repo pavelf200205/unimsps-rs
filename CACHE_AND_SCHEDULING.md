@@ -7,6 +7,9 @@ gets a disposable NVIDIA GLCache copied from an immutable first-successful-run
 seed. The supervisor waits for worker exit before publishing a new seed. Later
 sessions never update that seed. See the README's **NVIDIA driver-cache snapshots**
 section for paths, refresh behavior, concurrency and limitations.
+The default seed is shared across image counts and kernel settings for the same
+executable/driver installation and cache root. `--driver-cache-per-workload`
+restores separate workload snapshots without modifying the shared seed.
 
 The sections below retain historical implementation notes. In current code the
 CubeCL database environment is schema-named `unimsps-v4`, not revision-named;
