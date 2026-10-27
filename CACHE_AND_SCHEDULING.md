@@ -3,8 +3,10 @@
 ## Current driver-cache policy (2026-10-27)
 
 Windows Vulkan inference is now supervised by `src/driver_cache.rs`: each worker
-gets a disposable NVIDIA GLCache copied from an immutable first-successful-run
-seed. The supervisor waits for worker exit before publishing a new seed. Later
+gets a NVIDIA GLCache restored at the stable `<cache-root>/nvidia_gl_cache` path
+from an immutable first-successful-run seed. The driver receives an ordinary
+absolute Windows path, not a long, changing verbatim session path. The supervisor
+waits for worker exit before publishing a new seed. Later
 sessions never update that seed. See the README's **NVIDIA driver-cache snapshots**
 section for paths, refresh behavior, concurrency and limitations.
 The default seed is shared across image counts and kernel settings for the same

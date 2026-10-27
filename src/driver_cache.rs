@@ -1,4 +1,4 @@
-//! Windows Vulkan driver-cache isolation. The supervisor never initializes a GPU.
+//! Windows Vulkan fixed-path driver-cache restoration. The supervisor never initializes a GPU.
 //! Only a successful worker's first cache is published, after process teardown.
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -7,6 +7,26 @@ use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::Read,
     path::{Path, PathBuf}, process::{Command, ExitStatus}, time::{SystemTime, UNIX_EPOCH}};
 
 pub const SESSION_ENV: &str = "UNIMSPS_DRIVER_CACHE_SESSION";
+
+// Rust canonicalizes Windows paths with a verbatim prefix. Third-party driver
+// cache code may not accept that syntax; pass the ordinary absolute spelling.
+fn ordinary_path(path: &Path) -> Result<PathBuf> {
+    let text = path.to_str().context("Driver cache path must be valid Unicode")?;
+    if let Some(unc) = text.strip_prefix("\\\\?\\UNC\\") {
+        Ok(PathBuf::from(format!("\\\\{unc}")))
+    } else if let Some(disk) = text.strip_prefix("\\\\?\\") {
+        Ok(PathBuf::from(disk))
+    } else { Ok(path.to_path_buf()) }
+}
+
+fn clear_working(root: &Path, working: &Path) -> Result<()> {
+    if !working.exists() { return Ok(()); }
+    let resolved = fs::canonicalize(working)?;
+    ensure!(resolved.parent() == Some(root), "Unsafe driver-cache cleanup path");
+    files(working)?; // Refuse junctions/symlinks anywhere before recursive removal.
+    fs::remove_dir_all(working)?;
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct Manifest {
@@ -151,7 +171,7 @@ fn lock_root(root: &Path) -> Result<File> {
         .context("Cannot lock cache root. Another reconstruction may be using it; use a separate --kernel-cache-dir")
 }
 
-/// Launch the actual inference process with a disposable NVIDIA cache directory.
+/// Restore the NVIDIA cache at one stable path, then launch inference.
 /// A seed is never taken from legacy caches or from a session that reused a seed.
 pub fn supervise(cache_root: &Path, profile: String, persistent: bool, refresh: bool) -> Result<ExitStatus> {
     fs::create_dir_all(cache_root)?;
@@ -176,7 +196,7 @@ pub fn supervise(cache_root: &Path, profile: String, persistent: bool, refresh: 
     let seed = profile_dir.join("seed");
     let reused = persistent && !refresh && seed.exists();
     let session = unique_directory(&sessions)?;
-    let working = session.join("cache");
+    let working = ordinary_path(&root)?.join("nvidia_gl_cache");
     if reused {
         checked_metadata(&seed)?;
         checked_metadata(&seed.join("manifest.json"))?;
@@ -185,13 +205,19 @@ pub fn supervise(cache_root: &Path, profile: String, persistent: bool, refresh: 
             "Driver seed identity mismatch; use --refresh-driver-cache");
         let actual = files(&seed.join("cache"))?;
         ensure!(expected.files == actual, "Driver seed was modified; use --refresh-driver-cache");
+        clear_working(&root, &working)?;
         copy_tree(&seed.join("cache"), &working)?;
         eprintln!("NVIDIA driver cache: restoring immutable seed {}", seed.display());
     } else {
+        if working.exists() {
+            // Preserve existing evidence when starting a new profile/refresh.
+            files(&working)?;
+            fs::rename(&working, session.join("previous-driver-cache"))?;
+        }
         fs::create_dir(&working)?;
         eprintln!("NVIDIA driver cache: starting fresh (legacy cache folders are not imported)");
     }
-    eprintln!("NVIDIA driver cache working copy: {}", working.display());
+    eprintln!("NVIDIA driver cache fixed working path: {}", working.display());
     let status = Command::new(executable)
         .args(std::env::args_os().skip(1))
         .arg("--internal-cache-worker")
@@ -200,18 +226,20 @@ pub fn supervise(cache_root: &Path, profile: String, persistent: bool, refresh: 
         .env("__GL_SHADER_DISK_CACHE", "1")
         .env("__GL_SHADER_DISK_CACHE_PATH", &working)
         .env("__GL_SHADER_DISK_CACHE_SIZE", "2147483648")
-        .env_remove("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP")
+        // Match the driver's settings from the successful manual restore runs.
+        .env("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
         .status().context("Could not launch inference worker")?;
 
     // Waiting for process exit above is essential: driver DLL teardown may write
     // cache files after Rust's main has returned.
     if !status.success() {
-        eprintln!("Inference did not succeed; seed unchanged. Session preserved: {}", session.display());
+        eprintln!("Inference did not succeed; seed unchanged. Driver cache retained at {}", working.display());
         return Ok(status);
     }
     if persistent && !reused {
         let entries = files(&working)?;
         if has_shader_pair(&working, &entries) {
+            copy_tree(&working, &session.join("cache"))?;
             let manifest = Manifest { version: 1, profile: identity, files: entries };
             fs::write(session.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
             // Keep the previous seed as evidence during an explicit refresh.
@@ -227,11 +255,14 @@ pub fn supervise(cache_root: &Path, profile: String, persistent: bool, refresh: 
             eprintln!("NVIDIA driver cache: saved first successful run as {}", seed.display());
             return Ok(status);
         }
-        eprintln!("No populated NVIDIA shader cache found; no seed published (normal on other GPU vendors)");
+        eprintln!("WARNING: no populated NVIDIA shader cache at {}; no backup was saved. On NVIDIA this means driver reuse is NOT working; the next launch may compile again. On other vendors this is expected.", working.display());
     }
-    // Reused sessions NEVER update the seed, even when new shaders were compiled.
-    if let Err(error) = remove_session(&sessions, &session) {
+    // Leave the live-path cache in place after exit, just like manual runs. It
+    // will be replaced from the seed BEFORE the next launch, never merged back.
+    if !session.join("previous-driver-cache").exists() {
+      if let Err(error) = remove_session(&sessions, &session) {
         eprintln!("Could not remove disposable driver cache {}: {error:#}", session.display());
+      }
     }
     Ok(status)
 }

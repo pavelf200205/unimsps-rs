@@ -428,21 +428,15 @@ fn main() -> Result<()> {
                     "reserved_bytes":u.bytes_reserved,"in_use_bytes":u.bytes_in_use,
                     "padding_bytes":u.bytes_padding,"allocations":u.number_allocs
                 }));
-                std::fs::write(
-                    out.join("metadata.json"),
-                    serde_json::to_vec_pretty(
-                        &serde_json::json!({
+                // Keep macro invocations small: serde_json's recursive object
+                // parser otherwise exceeds Rust's default recursion limit.
+                let mut metadata = serde_json::json!({
                             "width":normal.w,"height":normal.h,"formats":save_formats.names(),
                             "normal_layout":"CHW float32 little endian","normal_axes":"upstream xyz, no axis flip",
                             "input_channels":"BGR","files":input.files,"model":model,"seconds":view_seconds,
-                            "sampling_seed":seed,"image_sampling":"chacha8_shuffle_without_replacement_v1",
-                            "max_inference_resolution":max_resolution,
-                            "inference_crop_hw":input.inference_crop,"original_crop_yxhw":input.crop,
-                            "resolution_resampled":input.inference_crop != [input.crop[2], input.crop[3]],
-                            "resolution_resampling_policy":"area_inputs_bilinear_normals_renormalized_v1",
-                            "nvidia_driver_cache_session":std::env::var_os(driver_cache::SESSION_ENV).map(PathBuf::from),
-                            "nvidia_driver_cache_policy":if isolated { Some(if cli.driver_cache_per_workload { "per_workload" } else { "shared" }) } else { None },
                             "inference_seconds":inference_seconds,"output_seconds":view_seconds-inference_seconds,
+                });
+                let processing_metadata = serde_json::json!({
                             "precision":format!("{dtype:?}"),"api":effective_api,"encoder_batch":effective_encoder_batch,
                             "pixel_batch":net.options.pixel_batch,"queue_depth":cli.queue_depth,"image_cache_mib":cli.image_cache_mib,
                             "score_budget_mib":cli.score_budget_mib,"fused_softmax":!cli.burn_softmax,
@@ -451,9 +445,19 @@ fn main() -> Result<()> {
                             "images":input.images.len(),"padded_size":input.size,"git_revision":env!("UNIMSPS_GIT_REVISION"),
                             "preparation_seconds":preparation_seconds,"persistent_cache_enabled":cache_enabled,
                             "was_warmed":was_warmed,"memory_after_view":memory_after_view,"crop_policy":"upstream exclusive maxima"
-                        }),
-                    )?,
-                )?;
+                });
+                let preprocessing_metadata = serde_json::json!({
+                    "sampling_seed":seed,"image_sampling":"chacha8_shuffle_without_replacement_v1",
+                    "max_inference_resolution":max_resolution,
+                    "inference_crop_hw":input.inference_crop,"original_crop_yxhw":input.crop,
+                    "resolution_resampled":input.inference_crop != [input.crop[2], input.crop[3]],
+                    "resolution_resampling_policy":"area_inputs_bilinear_normals_renormalized_v1",
+                    "nvidia_driver_cache_session":std::env::var_os(driver_cache::SESSION_ENV).map(PathBuf::from),
+                    "nvidia_driver_cache_policy":if isolated { Some(if cli.driver_cache_per_workload { "per_workload" } else { "shared" }) } else { None },
+                });
+                metadata.as_object_mut().unwrap().extend(processing_metadata.as_object().unwrap().clone());
+                metadata.as_object_mut().unwrap().extend(preprocessing_metadata.as_object().unwrap().clone());
+                std::fs::write(out.join("metadata.json"), serde_json::to_vec_pretty(&metadata)?)?;
                 println!(
                     "Saved normals to {} ({:.2}s)",
                     out.display(),

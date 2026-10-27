@@ -262,22 +262,23 @@ conv-pack and conv-matmul costs. This source change has not been built or timed.
 ### NVIDIA driver-cache snapshots (Windows Vulkan)
 
 Normal `infer` commands now run through a small supervisor. No extra flag is
-needed. Before inference, it creates a fresh working directory for NVIDIA's
-driver cache; after the inference process **fully exits successfully**, it saves
-the first populated cache as an immutable seed. Every later launch copies that
-same seed to a new working directory. NVIDIA may modify the working copy, but
-those modifications never replace the seed. Successful reused copies are removed
-after exit; failed/interrupted sessions are preserved for diagnosis and never
-published. A killed supervisor can leave a session directory behind; these are
-not reused or automatically swept on the next launch.
+needed. NVIDIA always receives the same ordinary absolute working path:
+`<kernel-cache-dir>/nvidia_gl_cache`. After the inference process **fully exits
+successfully**, the supervisor saves the first populated cache as an immutable
+seed. Before each later launch, it replaces the working folder with a copy of
+that seed. NVIDIA may modify the working copy, but those modifications never
+replace the seed. The working folder remains after exit until the next launch
+restores it. Failed/interrupted runs never publish a seed.
 
 The seed lives beneath
-`<kernel-cache-dir>/nvidia-driver-snapshots-v1/<profile>/seed`, with disposable
-copies under the neighboring `sessions` directory. Console output identifies
+`<kernel-cache-dir>/nvidia-driver-snapshots-v1/<profile>/seed`; the neighboring
+`sessions` directory is used for publication staging and archived old caches,
+not as the driver's working path. Console output identifies
 both paths; per-view metadata records the worker's driver-cache path. The seed's
-file hashes are checked before copying. Existing `nvidia_gl_cache` folders and
-manual backups are **left untouched and never imported automatically**, since
-they may contain the problematic accumulated state. Expect some driver compilation
+file hashes are checked before copying. When starting a new profile or refreshing,
+an existing working folder is archived rather than imported, since it may contain
+the problematic accumulated state. Manual backup folders are left untouched.
+Expect some driver compilation
 on the first launch of this build even with an existing CubeCL database.
 
 By default, all workloads in the same cache root share one first-successful-run
@@ -308,9 +309,11 @@ learns additional shaders automatically; missing shaders can compile into its
 disposable working copy again on subsequent runs.
 
 The supervisor overrides inherited `__GL_SHADER_DISK_CACHE*` path/enable/size
-settings for the worker and removes the forced skip-cleanup override. It does
+settings for the worker and sets `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1`, matching
+the earlier manual-restore configuration. It does
 not initialize a GPU itself. Its environment changes apply only to its child.
-Only NVIDIA consumes these variables; AMD/Intel/Mesa persistence is unchanged.
+Only NVIDIA consumes these variables. The managed Vulkan worker does not create
+unrelated CUDA or Mesa cache folders; other vendors retain their driver defaults.
 The wrapper is limited to Windows `infer` with `--api auto`/`vulkan`; CPU, CUDA,
 DX12, Metal and non-Windows paths retain their existing behavior. No change to
 the inference backend or NVIDIA-only compute dependency is introduced.
@@ -318,8 +321,8 @@ the inference backend or NVIDIA-only compute dependency is introduced.
 One reconstruction at a time may use a managed cache root, enforced by a Windows
 exclusive file handle that is released when the supervisor exits. Concurrent
 reconstructions must specify different `--kernel-cache-dir` values because the
-CubeCL runtime database is shared too. `--no-kernel-cache` uses a fresh disposable
-NVIDIA cache each launch and neither reads nor publishes a seed. This does not
+CubeCL runtime database is shared too. `--no-kernel-cache` starts the fixed NVIDIA
+working directory fresh each launch and neither reads nor publishes a seed. This does not
 promise to disable all other caches maintained internally by the driver.
 
 This workaround preserves CubeCL's separate SPIR-V/tuning database. It reproduces
